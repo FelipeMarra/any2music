@@ -1,7 +1,7 @@
 # MOSAIC Any2Music
-MOSAIC Any2Music (MAM) is a library for multimodal encoder-decoder model components with focus on music generation
+MOSAIC Any2Music (MAM) is a library for multimodal encoder-decoder model components with focus on music generation.
 
-## Instalation
+## Installation
 ```bash
 git clone https://github.com/FelipeMarra/any2music.git
 cd any2music
@@ -18,7 +18,5 @@ python3 -m pytest
 The `-s` flag can be used to show the prints inside the tests functions
 
 ## Available Components
-### Audio Tokenizes
-* EnCodec
-    * Implemented at [any2music/audio/tokenizers/encodec.py](any2music/audio/tokenizers/encodec.py)
-    * Documented at [docs/audio/tokenizers/encodec.md](docs/audio/tokenizers/encodec.md)
+### Audio Tokenizers
+* [EnCodec](docs/audio/tokenizers/encodec.md)
