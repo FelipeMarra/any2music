@@ -20,3 +20,6 @@ The `-s` flag can be used to show the prints inside the tests functions
 ## Available Components
 ### Audio Tokenizers
 * [EnCodec](docs/audio/tokenizers/encodec.md)
+
+### Audio Decoders
+* [MusicGen-like](docs/audio/decoders/musicgen.md)
