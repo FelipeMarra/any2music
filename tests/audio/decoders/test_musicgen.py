@@ -98,13 +98,12 @@ def test_musicgen_training():
 
         print(f"Update {update} | Loss: {loss.item():.4f}")
 
-    model.eval()
     # Run generation
-    # max_new_tokens = 250 -> roughly 5 seconds of audio at 50 Hz frame rate
+    model.eval()
     print("Generating audio tokens...")
     audio_tokens = model.generate(
         src=None,
-        max_new_tokens=250, 
+        max_new_tokens=int(TEST_SECs * encodec.frame_rate), 
         temperature=1.0,
         top_k=250
     )
@@ -114,8 +113,4 @@ def test_musicgen_training():
         decoded_audio = encodec.decode(audio_tokens)
 
     print(f"Decoded audio shape: {decoded_audio.shape}")
-
-    # Note: 250 tokens at 50Hz = ~5 seconds of audio. 
-    # Your assert will only pass if TEST_SECs is exactly equal to the length of audio generated.
-    # assert decoded_audio.shape == torch.Size([1, 1, encodec.sample_rate*TEST_SECs])
     save_audio("test.wav", decoded_audio.squeeze(0).cpu(), sample_rate=encodec.sample_rate)
