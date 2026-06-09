@@ -16,11 +16,11 @@ def test_encode_decode():
     audio_tensor = audio_tensor[:, :, :encodec.sample_rate*TEST_SECs].cuda() # subsample & cuda
     print(audio_tensor.shape)
 
-    encoded_audio, _ = encodec.encode(audio_tensor)
-    print(encoded_audio.shape)
-    assert encoded_audio.shape == torch.Size([1, 4, TEST_SECs*50])
+    codes, scale = encodec.encode(audio_tensor)
+    print(codes.shape)
+    assert codes.shape == torch.Size([1, 4, TEST_SECs*50])
 
-    decoded_audio = encodec.decode(encoded_audio)
+    decoded_audio = encodec.decode(codes, scale)
     print(decoded_audio.shape)
     assert decoded_audio.shape == torch.Size([1, 1, encodec.sample_rate*TEST_SECs])
 

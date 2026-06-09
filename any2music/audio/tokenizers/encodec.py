@@ -24,7 +24,7 @@ class HFEncodecCompressionModel(BaseAudioTokenizer):
         ]
         deltas = [nc - int(nc) for nc in num_codebooks]
         # Checking we didn't do some bad maths and we indeed have integers!
-        assert all(deltas) <= 1e-3, deltas
+        assert all(d <= 1e-3 for d in deltas), deltas
 
         self.possible_num_codebooks = [int(nc) for nc in num_codebooks]
         self.set_num_codebooks(max(self.possible_num_codebooks))

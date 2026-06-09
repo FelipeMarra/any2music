@@ -8,8 +8,7 @@ from any2music.audio.decoders.musicgen import DelayProvider, MusicGenTransformer
 
 AUDIO_PATH = "./audio_sample/legend_of_zelda.mp3"
 TEST_SECs = 15
-UPDATES = 500
-SAVE_GEN = False
+UPDATES = 50
 
 def test_delay_pattern():
     input_tensor = torch.tensor([
@@ -54,9 +53,15 @@ def test_musicgen_training():
 
     # Tokenize the audio
     with torch.no_grad():
-        encoded_audio, _ = encodec.encode(audio_tensor)
-        # encoded_audio shape: (Batch, Codebooks, SeqLen)
+        encoded_audio, scale = encodec.encode(audio_tensor)
         print(f"encoded_audio.shape: {encoded_audio.shape}\n")
+
+        # Add padding so we don't loose the first token for the delay
+        B, K, S = encoded_audio.shape
+        padding = torch.full((B, K, 1), model.pad_token_id, dtype=torch.long, device='cuda')
+        encoded_audio = torch.cat([padding, encoded_audio], dim=-1)
+        # encoded_audio shape: (Batch, Codebooks, SeqLen+1)
+        print(f"encoded_audio.shape after padding: {encoded_audio.shape}\n")
 
     # Apply the delay pattern for MusicGen
     # This shifts codebook 1 by 0, codebook 2 by 1, codebook 3 by 2, etc.
@@ -66,6 +71,7 @@ def test_musicgen_training():
         max_length=encoded_audio.shape[-1] + model.num_codebooks, # Add room for the shifts
         audio_channels=1
     )
+    print(f"delayed_audio: {delayed_audio[0, :, :4]}\n")
 
     # Create Inputs and Labels (shifted by 1)
     # Input is everything except the very last timestep
@@ -75,7 +81,8 @@ def test_musicgen_training():
 
     # NOTICE: All hyperparams here are for test
     criterium = torch.nn.CrossEntropyLoss(ignore_index=model.pad_token_id) # Ignore the padding tokens in the loss calculation
-    optim = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.95), weight_decay=0.0)
+    optim = torch.optim.AdamW(model.parameters(), lr=5e-4, betas=(0.9, 0.95), weight_decay=0.0)
+
     # NOTICE: Cosine scheduler is used in musicgen but we wont use it for testing
     # scheduler =  torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=100, eta_min=0.01)
 
@@ -103,14 +110,16 @@ def test_musicgen_training():
     print("Generating audio tokens...")
     audio_tokens = model.generate(
         src=None,
-        max_new_tokens=int(TEST_SECs * encodec.frame_rate), 
-        temperature=1.0,
-        top_k=250
+        max_new_tokens=int(TEST_SECs * encodec.frame_rate),
+        temperature=1e-4, # < 1 -> eliminate randomness | = 1 -> the distribution learned | > 1 -> aproximate a uniform distribution
+        top_k=1
     )
 
     # Decode back to audio
     with torch.no_grad():
-        decoded_audio = encodec.decode(audio_tokens)
+        decoded_audio = encodec.decode(audio_tokens, scale)
 
     print(f"Decoded audio shape: {decoded_audio.shape}")
     save_audio("test.wav", decoded_audio.squeeze(0).cpu(), sample_rate=encodec.sample_rate)
+
+    # TODO: KLD between the first 15s of the original song and the generated 15s -> should be a veeery small value

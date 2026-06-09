@@ -68,7 +68,7 @@ class MusicgenSinusoidalPositionalEmbedding(nn.Module):
         description in Section 3.5 of "Attention Is All You Need".
         """
         half_dim = embedding_dim // 2
-        emb = math.log(10000) / (half_dim - 1)
+        emb = math.log(10_000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, dtype=torch.int64).float() * -emb)
         emb = torch.arange(num_embeddings, dtype=torch.int64).float().unsqueeze(1) * emb.unsqueeze(0)
         emb = torch.cat([torch.cos(emb), torch.sin(emb)], dim=1).view(num_embeddings, -1)
@@ -218,6 +218,7 @@ def get_musicgen_decoder(
         activation=torch.nn.GELU(),
         dim_feedforward=size_params.d_model * 4,
         dropout=0.1,
+        norm_first=True,
         batch_first=True,
         dtype=dtype
     )
@@ -225,12 +226,13 @@ def get_musicgen_decoder(
 #########################################################
 # MusicGen Transformer
 #########################################################
+
 class MusicGenTransformer(nn.Module):
     def __init__(self, encoder:tp.Optional[nn.TransformerEncoder] = None, model_size:MusicGenSize=MusicGenSize.SMALL, dtype=torch.bfloat16):
         super().__init__()
         self.size_params = MUSICGEN_SIZES[model_size.value]
         self.vocab_size = 2048 + 1 # must match the codebook size used in Encodec + 1 for padding
-        self.pad_token_id: int = 2048
+        self.pad_token_id: int = 2048 # starts counting from 0
         self.max_seq_len = 1504 # encodec_frame_rate * audio_duration + embedding_dim (for the delay_pattern) -> 50 * 30 + 4 -> 1504
         self.num_codebooks = 4
         self.dtype = dtype
@@ -268,10 +270,10 @@ class MusicGenTransformer(nn.Module):
             # print(f"Memory is null, with shape: {memory.shape}\n")
         else:
             # Conditional path: Run standard encoder
-            # src_len = src.size(1)
-            # enc_x = self.enc_embedding(src) * math.sqrt(self.size_params.d_model) + self.pos_embedding[:, :src_len, :]
             memory = self.encoder(src)
             # print(f"Memory came from encoder with shape: {memory.shape}\n")
+
+        # TODO: Do we need a biderectional encoder mask?
 
         # Get embeddings per codebook
         dec_embs = torch.zeros(B, S, self.size_params.d_model, device=tgt.device, dtype=self.dtype)
@@ -307,6 +309,7 @@ class MusicGenTransformer(nn.Module):
             logits[indices_to_remove] = filter_value
         return logits
 
+    # TODO: KV cache
     @torch.no_grad()
     def generate(
         self,
@@ -327,9 +330,7 @@ class MusicGenTransformer(nn.Module):
         B = src.shape[0] if src is not None else 1
         K = self.num_codebooks
 
-        # TODO: Add BOS and EOS
         # Initialize the target tensor with padding tokens (acts as the BOS token setup)
-        # Shape: (B, K, 1)
         tgt = torch.full((B, K, 1), self.pad_token_id, dtype=torch.long, device=device)
 
         for step in range(max_new_tokens):
@@ -341,8 +342,20 @@ class MusicGenTransformer(nn.Module):
             # next_token_logits shape: (B, K, vocab_size)
             next_token_logits = logits[:, :, -1, :]
 
-            # Prevent the model from predicting the padding token during generation
-            next_token_logits[:, :, self.pad_token_id] = -float("Inf")
+            # Programatically setting the delay pattern for the padding tokens
+            for k in range(K):
+                if step < k:
+                    # Force padding token
+                    # 0;0 | 0;1 | 0;2 | 0;3  => a, P, P, P
+                    # 1;0 | 1;1 | 1;2 | 1;3  => a, b, P, P ...
+                    mask = torch.ones(self.vocab_size, dtype=torch.bool, device=device)
+                    mask[self.pad_token_id] = False
+                    next_token_logits[:, k, mask] = -float("inf")
+                else:
+                    # Prevent padding token
+                    next_token_logits[:, k, self.pad_token_id] = -float("inf")
+
+            # TODO: ClassifierFreeGuidanceLogitsProcessor
 
             # Apply Temperature scaling
             next_token_logits = next_token_logits / temperature
@@ -360,6 +373,7 @@ class MusicGenTransformer(nn.Module):
 
             # Reshape back to (B, K, 1)
             next_tokens = next_tokens_flat.view(B, K, 1)
+            # print(f"----> Generate Next Tokens are: {next_tokens} ") #TODO REMOVE
 
             # Append the newly generated tokens to the sequence
             tgt = torch.cat([tgt, next_tokens], dim=-1)
