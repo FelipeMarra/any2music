@@ -1,1 +1,2 @@
 from .channel_and_sample import load_mono_and_resample
+from .smoothing import apply_gaussian_smoothing

@@ -77,6 +77,10 @@ class DACCompressionModel(BaseAudioTokenizer):
     @property
     def total_codebooks(self) -> int:
         return max(self.possible_num_codebooks)
+    
+    @property
+    def vocab_size(self) -> int:
+        return self.model.codebook_size
 
     def set_num_codebooks(self, n: int):
         """Set the active number of codebooks used by the quantizer.

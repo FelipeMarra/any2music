@@ -1,14 +1,17 @@
+import math
 import torch
 from torchaudio import save as save_audio
 
+from audiotools import AudioSignal
 from any2music.audio.tokenizers import HFEncodecCompressionModel
+from any2music.audio.tokenizers import DACCompressionModel
 from any2music.audio.utils import load_mono_and_resample
 
 from any2music.audio.decoders.musicgen import DelayProvider, MusicGenTransformer, MusicGenSize
 
-AUDIO_PATH = "./samples/audio/legend_of_zelda_snes.mp3"
-TEST_SECs = 15
-UPDATES = 50
+AUDIO_PATH = "./samples/audio/legend_of_zelda_nes.mp3"
+TEST_SECs = 10
+UPDATES = 100
 
 def test_delay_pattern():
     input_tensor = torch.tensor([
@@ -43,9 +46,14 @@ def test_delay_pattern():
 
     assert torch.equal(reverted_delay, input_tensor[:, :, :reverted_delay.shape[-1]])
 
-def test_musicgen_training():
+def test_musicgen_encodec():
     encodec = HFEncodecCompressionModel.get_pretrained('facebook/encodec_32khz').cuda()
-    model = MusicGenTransformer(model_size=MusicGenSize.TEST).cuda()
+    model = MusicGenTransformer(
+            vocab_size=encodec.vocab_size,
+            frame_rate=int(encodec.frame_rate),
+            audio_duration=TEST_SECs,
+            model_size=MusicGenSize.TEST
+        ).cuda()
 
     audio_tensor = load_mono_and_resample(AUDIO_PATH, encodec.sample_rate)[0]
     audio_tensor = audio_tensor.unsqueeze(0) # add batch dim
@@ -110,7 +118,7 @@ def test_musicgen_training():
     print("Generating audio tokens...")
     audio_tokens = model.generate(
         src=None,
-        max_new_tokens=int(TEST_SECs * encodec.frame_rate),
+        max_new_tokens=int(TEST_SECs * encodec.frame_rate)+encodec.num_codebooks,
         temperature=1e-4, # < 1 -> eliminate randomness | = 1 -> the distribution learned | > 1 -> aproximate a uniform distribution
         top_k=1
     )
@@ -120,6 +128,99 @@ def test_musicgen_training():
         decoded_audio = encodec.decode(audio_tokens, scale)
 
     print(f"Decoded audio shape: {decoded_audio.shape}")
-    save_audio("test.wav", decoded_audio.squeeze(0).cpu(), sample_rate=encodec.sample_rate)
+    save_audio("test_musicgen_encodec.wav", decoded_audio.squeeze(0).cpu(), sample_rate=encodec.sample_rate)
+
+    # TODO: KLD between the first 15s of the original song and the generated 15s -> should be a veeery small value
+
+def test_musicgen_dac():
+    dac = DACCompressionModel.get_pretrained("44khz")
+    dac.set_num_codebooks(4)
+    model = MusicGenTransformer(
+        vocab_size=dac.vocab_size,
+        frame_rate=int(dac.frame_rate),
+        audio_duration=TEST_SECs,
+        model_size=MusicGenSize.TEST
+    ).cuda()
+
+    audio_tensor = AudioSignal(AUDIO_PATH).to_mono()
+    audio_tensor = audio_tensor[:, :, :dac.sample_rate*TEST_SECs].cuda() # subsample & cuda
+    print(f"audio_tensor.shape: {audio_tensor.shape}")
+
+    # Tokenize the audio
+    with torch.no_grad():
+        encoded_audio, meta = dac.encode(audio_tensor)
+        print(f"encoded_audio.shape: {encoded_audio.shape}\n")
+        print(f"encoded_audio meta: {meta}\n")
+
+        # Add padding so we don't loose the first token for the delay
+        B, K, S = encoded_audio.shape
+        padding = torch.full((B, K, 1), model.pad_token_id, dtype=torch.long, device='cuda')
+        encoded_audio = torch.cat([padding, encoded_audio], dim=-1)
+        # encoded_audio shape: (Batch, Codebooks, SeqLen+1)
+        print(f"encoded_audio.shape after padding: {encoded_audio.shape}\n")
+
+    # Apply the delay pattern for MusicGen
+    # This shifts codebook 1 by 0, codebook 2 by 1, codebook 3 by 2, etc.
+    delayed_audio, _ = DelayProvider.build_delay_pattern_mask(
+        input_ids=encoded_audio,
+        pad_token_id=model.pad_token_id,
+        max_length=encoded_audio.shape[-1] + model.num_codebooks,
+        audio_channels=1
+    )
+    print(f"delayed_audio shape: {delayed_audio.shape}\n")
+    print(f"delayed_audio: {delayed_audio[0, :, :4]}\n")
+
+    # Create Inputs and Labels (shifted by 1)
+    # Input is everything except the very last timestep
+    # Label is everything except the very first timestep
+    model_input = delayed_audio[:, :, :-1]
+    target_tokens = delayed_audio[:, :, 1:]
+
+    # NOTICE: All hyperparams here are for test
+    criterium = torch.nn.CrossEntropyLoss(ignore_index=model.pad_token_id) # Ignore the padding tokens in the loss calculation
+    optim = torch.optim.AdamW(model.parameters(), lr=5e-4, betas=(0.9, 0.95), weight_decay=0.0)
+
+    # NOTICE: Cosine scheduler is used in musicgen but we wont use it for testing
+    # scheduler =  torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=100, eta_min=0.01)
+
+    model.train()
+    for update in range(1, UPDATES):
+        optim.zero_grad()
+
+        logits = model(src=None, tgt=model_input)
+
+        # Reshape for CrossEntropyLoss
+        # Logits: (B, K, S, Vocab) -> (B * K * S, Vocab)
+        # Targets: (B, K, S) -> (B * K * S)
+        flat_logits = logits.reshape(-1, model.vocab_size)
+        flat_targets = target_tokens.reshape(-1)
+
+        # Compute loss and step
+        loss = criterium(flat_logits, flat_targets)
+        loss.backward()
+        optim.step()
+
+        print(f"Update {update} | Loss: {loss.item():.4f}")
+
+    # Run generation
+    model.eval()
+    print("Generating audio tokens...")
+    with torch.no_grad():
+        audio_tokens = model.generate(
+            src=None,
+            max_new_tokens=math.ceil(TEST_SECs * dac.frame_rate)+dac.num_codebooks,
+            temperature=1e-4, # < 1 -> eliminate randomness | = 1 -> the distribution learned | > 1 -> aproximate a uniform distribution
+            top_k=1
+        )
+
+    #meta["original_length"] = audio_tokens.shape[-1]
+    print(f"Generate audio codes shape: {audio_tokens.shape}\n")
+
+    # Decode back to audio
+    with torch.no_grad():
+        decoded_audio = dac.decode(audio_tokens.cpu(), meta)
+
+    print(f"Decoded audio shape: {decoded_audio.shape}")
+    decoded_audio.write('test_musicgen_dac.wav')
 
     # TODO: KLD between the first 15s of the original song and the generated 15s -> should be a veeery small value

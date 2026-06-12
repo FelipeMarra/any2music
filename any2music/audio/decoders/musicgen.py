@@ -37,7 +37,7 @@ class MusicGenSizeValues():
     num_decoder_layers: int
 
 MUSICGEN_SIZES:tp.Dict[str, MusicGenSizeValues] = {
-    "test": MusicGenSizeValues(d_model=512, nhead=8, num_decoder_layers=6), # 3213MiB
+    "test": MusicGenSizeValues(d_model=1024, nhead=16, num_decoder_layers=12), # 3213MiB
     "small": MusicGenSizeValues(d_model=1024, nhead=16, num_decoder_layers=24)
 }
 
@@ -232,16 +232,19 @@ def get_musicgen_decoder(
 class MusicGenTransformer(BaseDecoder):
     def __init__(
             self, 
+            vocab_size:int,
+            frame_rate:int,
+            audio_duration:int,
             encoder:tp.Optional[nn.TransformerEncoder] = None, 
             model_size:MusicGenSize=MusicGenSize.SMALL, 
             dtype:torch.dtype=torch.bfloat16
         ):
         super().__init__()
         self.size_params = MUSICGEN_SIZES[model_size.value]
-        self.vocab_size = 2048 + 1 # must match the codebook size used in Encodec + 1 for padding
-        self.pad_token_id: int = 2048 # starts counting from 0
-        self.max_seq_len = 1504 # encodec_frame_rate * audio_duration + embedding_dim (for the delay_pattern) -> 50 * 30 + 4 -> 1504
+        self.vocab_size = vocab_size + 1 # must match the codebook size used in the neural encoder + 1 for padding
+        self.pad_token_id: int = vocab_size # starts counting from 0
         self.num_codebooks = 4
+        self.max_seq_len = frame_rate*audio_duration+self.num_codebooks # frame_rate * audio_duration + embedding_dim (for the delay_pattern) -> 50 * 30 + 4 -> 1504
         self.dtype = dtype
 
         # Separate embedding layers for each codebook
@@ -254,7 +257,15 @@ class MusicGenTransformer(BaseDecoder):
         self.encoder = encoder
 
         dec_layer = get_musicgen_decoder(model_size=model_size, dtype=self.dtype)
-        self.decoder = nn.TransformerDecoder(dec_layer, num_layers=self.size_params.num_decoder_layers)
+
+        # Add a final LayerNorm to stabilize the output before the LM heads
+        final_norm = nn.LayerNorm(self.size_params.d_model, dtype=self.dtype)
+
+        self.decoder = nn.TransformerDecoder(
+            dec_layer, 
+            norm=final_norm,
+            num_layers=self.size_params.num_decoder_layers
+        )
 
         # One classification head for each codebook
         self.lm_heads = nn.ModuleList([
@@ -320,8 +331,8 @@ class MusicGenTransformer(BaseDecoder):
     @torch.no_grad()
     def generate(
         self,
+        max_new_tokens: int,
         src: tp.Optional[torch.Tensor] = None,
-        max_new_tokens: int = 200,
         temperature: float = 1.0,
         top_k: int = 250,
     ):

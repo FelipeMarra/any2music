@@ -90,3 +90,7 @@ class HFEncodecCompressionModel(BaseAudioTokenizer):
         if n not in self.possible_num_codebooks:
             raise ValueError(f"Allowed values for num codebooks: {self.possible_num_codebooks}")
         self._num_codebooks = n
+
+    @property
+    def vocab_size(self) -> int:
+        return self.model.config.codebook_size

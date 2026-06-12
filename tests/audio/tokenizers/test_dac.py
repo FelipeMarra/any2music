@@ -7,7 +7,7 @@ AUDIO_PATH = "./samples/audio/legend_of_zelda_nes.mp3"
 TEST_SECs = 15
 
 def test_dac_encode_decode():
-    dac = DACCompressionModel.get_pretrained("44khz")
+    dac = DACCompressionModel.get_pretrained("24khz")
     dac.set_num_codebooks(4) # Use the same amount of codebooks used by MusicGen
 
     print(f"DAC info: \n\tfr={dac.frame_rate}\n\tsr={dac.sample_rate}\n\tcodebook_size={dac.cardinality}\n\ttotal_n_codebooks={dac.total_codebooks}\n\tn_codebooks={dac.num_codebooks}")

@@ -62,6 +62,10 @@ class BaseAudioTokenizer(ABC, nn.Module):
     def total_codebooks(self) -> int:
         ...
 
+    @property
+    def vocab_size(self) -> int:
+        ...
+
     @abstractmethod
     def set_num_codebooks(self, n: int):
         """Set the active number of codebooks used by the quantizer."""
