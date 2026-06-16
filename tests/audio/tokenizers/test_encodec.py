@@ -5,7 +5,7 @@ from torchaudio import save as save_audio
 from any2music.audio.tokenizers import HFEncodecCompressionModel
 from any2music.audio.utils import load_mono_and_resample
 
-AUDIO_PATH = "./samples/audio/legend_of_zelda_snes.mp3"
+AUDIO_PATH = "./samples/audio/legend_of_zelda_nes.mp3"
 TEST_SECs = 15
 
 def test_encode_decode():
@@ -24,4 +24,4 @@ def test_encode_decode():
     print(decoded_audio.shape)
     assert decoded_audio.shape == torch.Size([1, 1, encodec.sample_rate*TEST_SECs])
 
-    save_audio("test.wav", decoded_audio.squeeze().cpu(), sample_rate=encodec.sample_rate)
+    save_audio("test_encodec_nes.wav", decoded_audio.squeeze().cpu(), sample_rate=encodec.sample_rate)

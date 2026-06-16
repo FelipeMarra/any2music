@@ -235,7 +235,7 @@ class MusicGenTransformer(BaseDecoder):
             vocab_size:int,
             frame_rate:int,
             audio_duration:int,
-            encoder:tp.Optional[nn.TransformerEncoder] = None, 
+            encoder:tp.Optional[nn.TransformerEncoder] = None,
             model_size:MusicGenSize=MusicGenSize.SMALL, 
             dtype:torch.dtype=torch.bfloat16
         ):
@@ -278,18 +278,23 @@ class MusicGenTransformer(BaseDecoder):
     def forward(self, src, tgt, drop_conditioning=False):
         B, K, S = tgt.shape
         # print(f"\nTarget shape: {tgt.shape}\n")
-        if src is not None: print(f"Src shape: {src.shape}\n")
+        #if src is not None: print(f"Src shape: {src.shape}\n")
 
         # CFG condition routing
-        if self.encoder is None or drop_conditioning or src is None:
-            # Unconditional path: Broadcast the learned null token across the batch.
-            # This completely bypasses the encoder, saving compute!
-            memory = self.null_memory.expand(B, 1, -1)
-            # print(f"Memory is null, with shape: {memory.shape}\n")
-        else:
-            # Conditional path: Run standard encoder
+        ## Conditional path: Run standard encoder
+        if src is not None and self.encoder is not None and not drop_conditioning:
             memory = self.encoder(src)
             # print(f"Memory came from encoder with shape: {memory.shape}\n")
+
+        ## Unconditional path: Broadcast the learned null token across the batch
+        if self.encoder is None and src is None or drop_conditioning:
+            memory = self.null_memory.expand(B, 1, -1)
+            # print(f"Memory is null, with shape: {memory.shape}\n")
+
+        ## Conditional path when the src comes already encoded 
+        if src is not None and self.encoder is None and not drop_conditioning:
+            memory = src
+            # print(f"Memory came ready w/o need to encode: {memory.shape}\n")
 
         # TODO: Do we need a biderectional encoder mask?
 
