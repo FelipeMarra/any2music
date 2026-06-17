@@ -1,22 +1,6 @@
 # MOSAIC Any2Music
 MOSAIC Any2Music (MAM) is a library for multimodal encoder-decoder model components with focus on music generation.
 
-## Installation
-```bash
-git clone https://github.com/FelipeMarra/any2music.git
-cd any2music
-python3 -m venv env
-source env/bin/activate
-python3 -m pip install -e .
-```
-
-## Testing
-From the repositorie's root directory, run:
-```bash
-python3 -m pytest
-```
-The `-s` flag can be used to show the prints inside the tests functions
-
 ## Available Components
 ### Audio Tokenizers
 * [EnCodec](docs/audio/tokenizers/encodec.md)
@@ -27,3 +11,18 @@ The `-s` flag can be used to show the prints inside the tests functions
 
 ### Audio Decoders
 * [MusicGen-like](docs/audio/decoders/musicgen.md)
+
+## Installation
+```bash
+conda create -n any2music python=3.10.12
+conda activate any2music
+git clone https://github.com/FelipeMarra/any2music.git
+python3 -m pip install -e ./any2music --extra-index-url https://download.pytorch.org/whl/cu126
+```
+
+## Testing
+From the repositorie's root directory, run:
+```bash
+python3 -m pytest
+```
+The `-s` flag can be used to show the prints inside the tests functions

@@ -10,6 +10,8 @@ authors = [
 ]
 description = "A package from the MOSAIC Group at Universidade Federal de Minas Gerais. At first it aims at generating music in various modalities and conditioned on various modalities."
 
+dynamic = ["dependencies"]
+
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]}
 
