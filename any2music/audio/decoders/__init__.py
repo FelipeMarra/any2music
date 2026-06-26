@@ -1,1 +1,1 @@
-from .musicgen import DelayProvider, MusicGenTransformer, MusicGenSize, MUSICGEN_SIZES
+from .musicgen import DelayProvider, MusicgenSinusoidalPositionalEmbedding, MusicGenTransformer, MusicGenSize, MUSICGEN_SIZES

@@ -1,0 +1,1 @@
+TheLegendofZelda, Action-adventure, NES, fast, Bb minor

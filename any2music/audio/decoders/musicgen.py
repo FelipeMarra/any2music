@@ -305,6 +305,7 @@ class MusicGenTransformer(BaseDecoder):
             # print(f"Memory came ready w/o need to encode: {memory.shape}\n")
 
         # Get embeddings per codebook
+        # TODO: Am I accumulating the codebooks embeddings????
         dec_embs = torch.zeros(B, S, self.size_params.d_model, device=tgt.device, dtype=self.dtype)
         for i in range(K):
             dec_embs += self.dec_embedding_layers[i](tgt[:, i, :])
@@ -369,7 +370,7 @@ class MusicGenTransformer(BaseDecoder):
             logits = self(src=src, tgt=tgt, src_mask=src_mask)
 
             # Extract logits from the last step in the sequence
-            # next_token_logits shape: (B, K, vocab_size)
+            # next_token_logits shape: (B, K, S, vocab_size)
             next_token_logits = logits[:, :, -1, :]
 
             # Programatically setting the delay pattern for the padding and bos tokens
