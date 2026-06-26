@@ -7,3 +7,6 @@ einops
 torchcodec
 descript-audio-codec
 pytest
+frechet_audio_distance==0.3.4
+laion_clap==1.1.7
+git+https://github.com/kkoutini/passt_hear21@0.0.18#egg=hear21passt
