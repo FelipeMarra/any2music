@@ -13,6 +13,7 @@ from any2music.audio.decoders.musicgen import DelayProvider, MusicGenTransformer
 
 AUDIO_PATH = "./samples/audio/legend_of_zelda_nes.mp3"
 AUDIO_PATH_SNES = "./samples/audio/legend_of_zelda_snes.mp3"
+AUDIO_PATH_JAMENDO = "/home/es119256/dados/repos/any2music/samples/audio/mtg_jamendo_220.wav"
 TEST_SECs = 10
 UPDATES = 100
 
@@ -41,11 +42,12 @@ def test_delay_pattern():
 
 
 def tokenize_audio(wav:tp.Union[str, torch.Tensor], audio_secs:int, audio_tokenizer):
-    max_audio_len = audio_tokenizer.sample_rate*audio_secs
+    sr = audio_tokenizer.sample_rate
+    max_audio_len = sr*audio_secs
     max_audio_tokens = int(audio_tokenizer.frame_rate*audio_secs)
 
     if isinstance(wav, str):
-        audio_tensor = AudioSignal(wav, device='cuda').to_mono()[:, :, :max_audio_len].cuda()
+        audio_tensor = AudioSignal(wav, device='cuda').resample(sr).to_mono()[:, :, :max_audio_len].cuda()
     else:
         audio_tensor = wav
 
@@ -53,7 +55,7 @@ def tokenize_audio(wav:tp.Union[str, torch.Tensor], audio_secs:int, audio_tokeni
     encoded_audio, meta = audio_tokenizer.encode(audio_tensor)
     encoded_audio = encoded_audio[:, :, :max_audio_tokens]
 
-    print(f"encoded_audio.shape after max_audio_tokens: {encoded_audio.shape}\n")
+    print(f"encoded_audio.shape after max_audio_tokens: {encoded_audio.shape}\nmeta: {meta}")
 
     # Add special tokens
     B, K, S = encoded_audio.shape
@@ -231,16 +233,19 @@ def test_musicgen_t5_dac():
 
     nes_text = "NES"
     snes_text = "SUPER"
+    jamendo_text = "JAMENDO"
 
     nes_t5_input = t5.tokenize([nes_text])
     snes_t5_input = t5.tokenize([snes_text])
+    jamendo_t5_input = t5.tokenize([jamendo_text])
 
     with torch.no_grad():
         nes_t5_embeds, _ = t5(nes_t5_input)
         snes_t5_embeds, _ = t5(snes_t5_input)
+        jamendo_t5_embeds, _ = t5(jamendo_t5_input)
 
-    conditioners_txt = [nes_text, snes_text]
-    conditioners = [nes_t5_embeds.to(torch.bfloat16), snes_t5_embeds.to(torch.bfloat16)]
+    conditioners_txt = [nes_text, snes_text, jamendo_text]
+    conditioners = [nes_t5_embeds.to(torch.bfloat16), snes_t5_embeds.to(torch.bfloat16), jamendo_t5_embeds.to(torch.bfloat16)]
 
     del t5
 
@@ -260,10 +265,11 @@ def test_musicgen_t5_dac():
     # Tokenize the audio
     nes_input_tokens, nes_target_tokens, nes_meta = tokenize_audio(AUDIO_PATH, TEST_SECs, dac) # type: ignore
     snes_input_tokens, snes_target_tokens, snes_meta = tokenize_audio(AUDIO_PATH_SNES, TEST_SECs, dac) # type: ignore
+    jamendo_input_tokens, jamendo_target_tokens, jamendo_meta = tokenize_audio(AUDIO_PATH_JAMENDO, TEST_SECs, dac) # type: ignore
 
-    metas = [nes_meta, snes_meta]
-    model_inputs = [nes_input_tokens, snes_input_tokens]
-    target_tokens = [nes_target_tokens, snes_target_tokens]
+    metas = [nes_meta, snes_meta, jamendo_meta]
+    model_inputs = [nes_input_tokens, snes_input_tokens, jamendo_input_tokens]
+    target_tokens = [nes_target_tokens, snes_target_tokens, jamendo_target_tokens]
 
     # NOTICE: All hyperparams here are for test
     criterium = torch.nn.CrossEntropyLoss(ignore_index=model.pad_token_id) # Ignore the padding tokens in the loss calculation

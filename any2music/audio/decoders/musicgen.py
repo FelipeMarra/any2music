@@ -339,6 +339,35 @@ class MusicGenTransformer(BaseDecoder):
             logits[indices_to_remove] = filter_value
         return logits
 
+
+    def top_p_filtering(self, logits: torch.Tensor, p: float = 0.9) -> torch.Tensor:
+        # Convert logits to probabilities
+        probs = F.softmax(logits, dim=-1)
+        
+        # Sort probabilities in descending order
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+        
+        # Compute cumulative probabilities
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        
+        # Create a mask to remove tokens outside top_p
+        # We shift the mask to ensure we keep the first token that crosses the threshold
+        sorted_indices_to_remove = cumulative_probs > p
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = False
+        
+        # Scatter mask back to original token ordering
+        indices_to_remove = sorted_indices_to_remove.scatter(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)
+        
+        # Filter logits, re-normalize probabilities, and sample
+        filtered_logits = logits.clone()
+        filtered_logits[indices_to_remove] = float('-inf')
+        
+        filtered_probs = F.softmax(filtered_logits, dim=-1)
+        
+        return filtered_probs
+
+
     # TODO: KV cache
     @torch.no_grad()
     def generate(
@@ -348,6 +377,7 @@ class MusicGenTransformer(BaseDecoder):
         src_mask=None,
         temperature: float = 1.0,
         top_k: int = 250,
+        top_p=0.90,
         cfg_scale: float = 3.0 # Added CFG weight
     ):
         self.eval()
@@ -355,9 +385,9 @@ class MusicGenTransformer(BaseDecoder):
         B = src.shape[0] if src is not None else 1
         K = self.num_codebooks
 
-        # Initialize tgt exactly like the delayed training data (Step 0)
-        tgt = torch.full((B, K, 1), self.pad_token_id, dtype=torch.long, device=device)
-        tgt[:, 0, 0] = self.bos_token_id
+        # Initialize tgt exactly like the delayed training data (step 0)
+        tgt = torch.full((B, K, 2), self.pad_token_id, dtype=torch.long, device=device)
+        tgt[:, 0, 1] = self.bos_token_id
 
         for step in range(max_new_tokens):
             # Implement CFG with a dual forward pass
@@ -387,7 +417,7 @@ class MusicGenTransformer(BaseDecoder):
 
             next_token_logits = next_token_logits / temperature
             next_token_logits = self.top_k_filtering(next_token_logits, top_k=top_k)
-            probs = F.softmax(next_token_logits, dim=-1)
+            probs = self.top_p_filtering(next_token_logits, p=top_p)
 
             probs_flat = probs.view(B * K, -1)
             next_tokens_flat = torch.multinomial(probs_flat, num_samples=1)
@@ -399,16 +429,13 @@ class MusicGenTransformer(BaseDecoder):
             if next_tokens[0, K-1, 0].item() == self.eos_token_id:
                 break
 
-        # Remove the initial initialization column
-        tgt = tgt[:, :, 1:]
-
         # Realign the codebooks to fix the delay pattern offset
         aligned_audio_tokens = DelayProvider.revert_delay_pattern(tgt)
 
         # The first frame of the realigned tokens is always the BOS token; slice it out
-        aligned_audio_tokens = aligned_audio_tokens[:, :, 1:]
+        aligned_audio_tokens = aligned_audio_tokens[:, :, 2:]
 
-        # 2. Bulletproof Safety Mask: Catch ANY out-of-bounds tokens
+        # Bulletproof Safety Mask: Catch ANY out-of-bounds tokens
         # This catches negative padding (< 0) and unshifted special tokens (>= pad_token_id)
         invalid_mask = (aligned_audio_tokens < 0) | (aligned_audio_tokens >= self.pad_token_id)
         aligned_audio_tokens[invalid_mask] = 0
