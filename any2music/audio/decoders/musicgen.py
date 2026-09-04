@@ -329,12 +329,11 @@ class MusicGenTransformer(BaseDecoder):
 
         return logits
 
+
     def top_k_filtering(self, logits: torch.Tensor, top_k: int = 250, filter_value: float = -float("Inf")):
-        """
-        Filters logits to only keep the top k probabilities.
-        """
         if top_k > 0:
-            # Remove all tokens with a probability less than the last token of the top-k
+            top_k = min(top_k, logits.size(-1))
+            logits = logits.clone()
             indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
             logits[indices_to_remove] = filter_value
         return logits
@@ -368,12 +367,12 @@ class MusicGenTransformer(BaseDecoder):
         return filtered_probs
 
 
-    # TODO: KV cache
     @torch.no_grad()
     def generate(
         self,
         max_new_tokens: int,
         src: tp.Optional[torch.Tensor] = None,
+        batch_size = 1,
         src_mask=None,
         temperature: float = 1.0,
         top_k: int = 250,
@@ -382,13 +381,14 @@ class MusicGenTransformer(BaseDecoder):
     ):
         self.eval()
         device = next(self.parameters()).device
-        B = src.shape[0] if src is not None else 1
+        B = src.shape[0] if src is not None else batch_size
         K = self.num_codebooks
 
         # Initialize tgt exactly like the delayed training data (step 0)
         tgt = torch.full((B, K, 2), self.pad_token_id, dtype=torch.long, device=device)
         tgt[:, 0, 1] = self.bos_token_id
 
+        unfinished_sequences = torch.ones(B, dtype=torch.bool, device=device)
         for step in range(max_new_tokens):
             # Implement CFG with a dual forward pass
             if src is not None:
@@ -422,11 +422,21 @@ class MusicGenTransformer(BaseDecoder):
             probs_flat = probs.view(B * K, -1)
             next_tokens_flat = torch.multinomial(probs_flat, num_samples=1)
             next_tokens = next_tokens_flat.view(B, K, 1)
-            
+
+            # Check which sequences hit EOS THIS step
+            has_eos = next_tokens[:, K-1, 0] == self.eos_token_id
+
+            # Force sequences that ALREADY finished in previous steps to output padding.
+            # (~unfinished_sequences identifies batches that are already done).
+            next_tokens[~unfinished_sequences, :, :] = self.pad_token_id
+
             tgt = torch.cat([tgt, next_tokens], dim=-1)
 
-            # Only break if the LAST codebook outputs EOS, ensuring all frames finish
-            if next_tokens[0, K-1, 0].item() == self.eos_token_id:
+            # Update the global tracker for the NEXT step
+            unfinished_sequences = unfinished_sequences.masked_fill(has_eos, False)
+
+            # Only break when ALL sequences in the batch have output EOS
+            if not unfinished_sequences.any():
                 break
 
         # Realign the codebooks to fix the delay pattern offset
@@ -435,9 +445,9 @@ class MusicGenTransformer(BaseDecoder):
         # The first frame of the realigned tokens is always the BOS token; slice it out
         aligned_audio_tokens = aligned_audio_tokens[:, :, 2:]
 
-        # Bulletproof Safety Mask: Catch ANY out-of-bounds tokens
-        # This catches negative padding (< 0) and unshifted special tokens (>= pad_token_id)
-        invalid_mask = (aligned_audio_tokens < 0) | (aligned_audio_tokens >= self.pad_token_id)
-        aligned_audio_tokens[invalid_mask] = 0
-    
-        return aligned_audio_tokens
+        # In generate(): calculate frame counts before applying safety mask
+        valid_mask = (aligned_audio_tokens >= 0) & (aligned_audio_tokens < self.pad_token_id)
+        valid_lengths = valid_mask.all(dim=1).sum(dim=-1) # Shape: (B,)
+
+        aligned_audio_tokens[~valid_mask] = 0
+        return aligned_audio_tokens, valid_lengths

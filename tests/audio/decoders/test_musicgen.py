@@ -16,6 +16,7 @@ AUDIO_PATH_SNES = "./samples/audio/legend_of_zelda_snes.mp3"
 AUDIO_PATH_JAMENDO = "/home/es119256/dados/repos/any2music/samples/audio/mtg_jamendo_220.wav"
 TEST_SECs = 10
 UPDATES = 100
+UNCOND_GEN_B_SIZE = 5
 
 def test_delay_pattern():
     input_tensor = torch.tensor([
@@ -121,7 +122,7 @@ def test_musicgen_encodec():
     # scheduler =  torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=100, eta_min=0.01)
 
     model.train()
-    for update in range(1, UPDATES):
+    for update in range(1, UPDATES+1):
         optim.zero_grad()
 
         logits = model(src=None, tgt=input_tokens)
@@ -142,8 +143,9 @@ def test_musicgen_encodec():
     # Run generation
     model.eval()
     print("Generating audio tokens...")
-    audio_tokens = model.generate(
+    audio_tokens, valid_lengths = model.generate(
         src=None,
+        batch_size=UNCOND_GEN_B_SIZE,
         max_new_tokens=model.max_seq_len,
         temperature=1e-4, # < 1 -> eliminate randomness | = 1 -> the distribution learned | > 1 -> aproximate a uniform distribution
         top_k=1
@@ -152,9 +154,16 @@ def test_musicgen_encodec():
     # Decode back to audio
     with torch.no_grad():
         decoded_audio = encodec.decode(audio_tokens, scale)
+        print(f"(test_musicgen_encodec) Decoded audio shape: {decoded_audio.shape}")
 
-    print(f"Decoded audio shape: {decoded_audio.shape}")
-    save_audio("test_musicgen_encodec.wav", decoded_audio.squeeze(0).cpu(), sample_rate=encodec.sample_rate)
+    for b in range(UNCOND_GEN_B_SIZE):
+        print(f"(test_musicgen_encodec) b: {b}")
+        valid_samples = int((valid_lengths[b].item() / encodec.frame_rate) * encodec.sample_rate)
+        print(f"(test_musicgen_encodec) valid_samples: {valid_samples}")
+        decoded_audio_b = decoded_audio[b, :, :valid_samples]
+        print(f"(test_musicgen_encodec) Decoded audio Afeter Filter Valid: {decoded_audio_b.shape}")
+
+        save_audio("test_musicgen_encodec.wav", decoded_audio_b.squeeze(0).cpu(), sample_rate=encodec.sample_rate)
 
     # TODO: KLD between the first 15s of the original song and the generated 15s -> should be a veeery small value
 
@@ -183,7 +192,7 @@ def test_musicgen_dac():
     # scheduler =  torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=100, eta_min=0.01)
 
     model.train()
-    for update in range(1, UPDATES):
+    for update in range(1, UPDATES+1):
         optim.zero_grad()
 
         logits = model(src=None, tgt=input_tokens)
@@ -203,25 +212,29 @@ def test_musicgen_dac():
 
     # Run generation
     model.eval()
-    print("Generating audio tokens...")
+    print("(test_musicgen_dac) Generating audio tokens...")
     with torch.no_grad():
-        audio_tokens = model.generate(
+        audio_tokens, valid_lengths = model.generate(
             src=None,
+            batch_size=UNCOND_GEN_B_SIZE,
             max_new_tokens=model.max_seq_len,
             temperature=1e-4, # < 1 -> eliminate randomness | = 1 -> the distribution learned | > 1 -> aproximate a uniform distribution
             top_k=1
         )
 
-    print(f"Generate audio codes shape: {audio_tokens.shape}\n")
+    print(f"(test_musicgen_dac) Generate audio codes shape: {audio_tokens.shape}\n")
 
     # Decode back to audio
     with torch.no_grad():
         decoded_audio = dac.decode(audio_tokens.cpu(), meta)
+        print(f"(test_musicgen_dac) Decoded audio shape: {decoded_audio.shape}")
 
-    print(f"Decoded audio shape: {decoded_audio.shape}")
-    total_generated_samples = audio_tokens.shape[-1] * dac.model.hop_length
-    meta['original_length'] = min(meta['original_length'], total_generated_samples)
-    decoded_audio.write('test_musicgen_dac.wav')
+    for b in range(UNCOND_GEN_B_SIZE):
+        valid_samples = int((valid_lengths[b].item() / dac.frame_rate) * dac.sample_rate)
+        decoded_audio_b = decoded_audio[b, :, :valid_samples]
+        print(f"(test_musicgen_dac) Decoded audio Afeter Filter Valid: {decoded_audio_b.shape}")
+
+        decoded_audio_b.write('test_musicgen_dac.wav')
 
     # TODO: KLD between the first 15s of the original song and the generated 15s -> should be a veeery small value
 
@@ -231,23 +244,21 @@ def test_musicgen_t5_dac():
     dec_size = MUSICGEN_SIZES["test"]
     t5 = T5Conditioner('t5-base', dec_size.d_model, device='cuda').cuda()
 
-    nes_text = "NES"
-    snes_text = "SUPER"
-    jamendo_text = "JAMENDO"
+    conditioners_txt = ["NES", "SUPER", "JAMENDO"]
 
-    nes_t5_input = t5.tokenize([nes_text])
-    snes_t5_input = t5.tokenize([snes_text])
-    jamendo_t5_input = t5.tokenize([jamendo_text])
-
+    # Tokenize in a single batch to automatically handle padding alignment
+    t5_inputs = t5.tokenize(conditioners_txt) # type: ignore
     with torch.no_grad():
-        nes_t5_embeds, _ = t5(nes_t5_input)
-        snes_t5_embeds, _ = t5(snes_t5_input)
-        jamendo_t5_embeds, _ = t5(jamendo_t5_input)
+        conditioners, src_mask = t5(t5_inputs)
 
-    conditioners_txt = [nes_text, snes_text, jamendo_text]
-    conditioners = [nes_t5_embeds.to(torch.bfloat16), snes_t5_embeds.to(torch.bfloat16), jamendo_t5_embeds.to(torch.bfloat16)]
+    conditioners = conditioners.to(torch.bfloat16)
+    src_mask = src_mask.to(torch.bfloat16)
+    src_mask = ~src_mask.bool() if src_mask.dtype == torch.bool else (src_mask == 0)
+
+    print(f"(test_musicgen_t5_dac) Conditioners shape {conditioners.shape}")
 
     del t5
+    torch.cuda.empty_cache()
 
     # DAC
     dac = DACCompressionModel.get_pretrained("44khz")
@@ -268,60 +279,62 @@ def test_musicgen_t5_dac():
     jamendo_input_tokens, jamendo_target_tokens, jamendo_meta = tokenize_audio(AUDIO_PATH_JAMENDO, TEST_SECs, dac) # type: ignore
 
     metas = [nes_meta, snes_meta, jamendo_meta]
-    model_inputs = [nes_input_tokens, snes_input_tokens, jamendo_input_tokens]
-    target_tokens = [nes_target_tokens, snes_target_tokens, jamendo_target_tokens]
+    model_inputs = torch.cat([nes_input_tokens, snes_input_tokens, jamendo_input_tokens])
+    print(f"(test_musicgen_t5_dac) Model Inputs shape {model_inputs.shape}")
+    target_tokens = torch.cat([nes_target_tokens, snes_target_tokens, jamendo_target_tokens])
+    print(f"(test_musicgen_t5_dac) Target Tokens shape {target_tokens.shape}")
 
     # NOTICE: All hyperparams here are for test
     criterium = torch.nn.CrossEntropyLoss(ignore_index=model.pad_token_id) # Ignore the padding tokens in the loss calculation
     optim = torch.optim.AdamW(model.parameters(), lr=5e-4, betas=(0.9, 0.95), weight_decay=0.0)
 
-    # NOTICE: Cosine scheduler is used in musicgen but we wont use it for testing
-    # scheduler =  torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=100, eta_min=0.01)
-
-    training_data = list(zip(conditioners, model_inputs, target_tokens))
-
     model.train()
-    for update in range(1, UPDATES):
-        for _ in range(len(training_data)):
-            src, model_input, target = random.choice(training_data)
+    for update in range(1, UPDATES+1):
+        optim.zero_grad()
+        logits = model(src=conditioners, tgt=model_inputs)
 
-            optim.zero_grad()
-            logits = model(src=src, tgt=model_input)
+        # Reshape for CrossEntropyLoss
+        flat_logits = logits.reshape(-1, model.vocab_size)
+        flat_targets = target_tokens.reshape(-1)
 
-            # Reshape for CrossEntropyLoss
-            flat_logits = logits.reshape(-1, model.vocab_size)
-            flat_targets = target.reshape(-1)
+        # Compute loss and step
+        loss = criterium(flat_logits, flat_targets)
+        loss.backward()
+        optim.step()
 
-            # Compute loss and step
-            loss = criterium(flat_logits, flat_targets)
-            loss.backward()
-            optim.step()
-
-            print(f"Update {update} | Loss: {loss.item():.4f}")
+        print(f"Update {update} | Loss: {loss.item():.4f}")
 
     # Run generation
+
     model.eval()
     with torch.no_grad():
-        for name, src, meta in zip(conditioners_txt, conditioners, metas):
-            print(f"Generating audio tokens for {name}...")
-            audio_tokens = model.generate(
-                src=src,
-                max_new_tokens=model.max_seq_len,
-                temperature=1e-4, # < 1 -> eliminate randomness | = 1 -> the distribution learned | > 1 -> aproximate a uniform distribution
-                top_k=1
-            )
+        audio_tokens, valid_lengths = model.generate(
+            src=conditioners,
+            src_mask=src_mask,
+            max_new_tokens=model.max_seq_len,
+            temperature=1e-4, # < 1 -> eliminate randomness | = 1 -> the distribution learned | > 1 -> aproximate a uniform distribution
+            top_k=1
+        )
 
-            print(f"Generate audio codes shape: {audio_tokens.shape}\n")
-            print(f"Generate audio final codes: {audio_tokens[:, :, -4:]}\n")
+        print(f"(test_musicgen_t5_dac) Generated audio codes shape: {audio_tokens.shape}\n")
+        print(f"(test_musicgen_t5_dac) Generated audio final codes: {audio_tokens[:, :, -4:]}\n")
 
-            # Decode back to audio
-            with torch.no_grad():
-                audio_tokens = torch.clamp(audio_tokens, min=0, max=dac.orig_vocab_size - 1)
-                total_generated_samples = audio_tokens.shape[-1] * dac.model.hop_length
-                meta['original_length'] = min(meta['original_length'], total_generated_samples)
-                decoded_audio = dac.decode(audio_tokens.cpu(), meta)
+        B = conditioners.shape[0]
+        for b in range(B):
+            print(f"(test_musicgen_t5_dac) Generating audio tokens for {conditioners_txt[b]}...")
 
-            print(f"Decoded audio shape: {decoded_audio.shape}")
-            decoded_audio.write(f'test_musicgen_t5_dac_{name}.wav')
+            meta = metas[b]
+            audio_tokens_b = audio_tokens[b].clone().unsqueeze(0)
+            audio_tokens_b = torch.clamp(audio_tokens_b, min=0, max=dac.orig_vocab_size - 1)
 
-            # TODO: KLD between the first 15s of the original song and the generated 15s -> should be a veeery small value
+            # Truncate valid samples cleanly on AudioSignal or raw Tensor
+            valid_samples = valid_lengths[b].item()
+            audio_tokens_b = audio_tokens_b[:, :, :valid_samples]
+            print(f"(test_musicgen_t5_dac) Clean audio codes shape: {audio_tokens_b.shape} | valid_samples {valid_samples}")
+
+            total_generated_samples = audio_tokens_b.shape[-1] * dac.model.hop_length
+            meta['original_length'] = min(meta['original_length'], total_generated_samples)
+            decoded_audio = dac.decode(audio_tokens_b.cpu(), meta)
+
+            print(f"(test_musicgen_t5_dac) Decoded & Valid audio shape: {decoded_audio.shape}\n")
+            decoded_audio.write(f'test_musicgen_t5_dac_{conditioners_txt[b]}.wav')

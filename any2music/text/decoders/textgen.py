@@ -213,7 +213,34 @@ class TextGenTransformer(BaseDecoder):
             logits[indices_to_remove] = filter_value
         return logits
 
-    # TODO: KV cache
+
+    def top_p_filtering(self, logits: torch.Tensor, p: float = 0.9) -> torch.Tensor:
+        # Convert logits to probabilities
+        probs = F.softmax(logits, dim=-1)
+        
+        # Sort probabilities in descending order
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+        
+        # Compute cumulative probabilities
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        
+        # Create a mask to remove tokens outside top_p
+        # We shift the mask to ensure we keep the first token that crosses the threshold
+        sorted_indices_to_remove = cumulative_probs > p
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = False
+        
+        # Scatter mask back to original token ordering
+        indices_to_remove = sorted_indices_to_remove.scatter(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)
+        
+        # Filter logits, re-normalize probabilities, and sample
+        filtered_logits = logits.clone()
+        filtered_logits[indices_to_remove] = float('-inf')
+        
+        filtered_probs = F.softmax(filtered_logits, dim=-1)
+        
+        return filtered_probs
+
     @torch.no_grad()
     def generate(
         self,
@@ -222,7 +249,8 @@ class TextGenTransformer(BaseDecoder):
         src_mask=None,
         temperature: float = 1.0,
         cfg_scale: float = 3.0, # Added CFG weight
-        top_k: int = 250
+        top_k: int = 250,
+        top_p: float = 0.9
     ):
         """
         Autoregressive generation loop for MusicGen.
@@ -238,7 +266,8 @@ class TextGenTransformer(BaseDecoder):
         # Initialize the target tensor with BOS token
         tgt = torch.full((B, 1), self.bos_token_id, dtype=torch.long, device=device)
 
-        for _ in range(max_new_tokens):
+        unfinished_sequences = torch.ones(B, dtype=torch.bool, device=device)
+        for step in range(max_new_tokens):
             # Implement CFG with a dual forward pass
             if src is not None:
                 logits_cond = self(src=src, tgt=tgt, src_mask=src_mask)
@@ -256,16 +285,19 @@ class TextGenTransformer(BaseDecoder):
             # Apply Temperature scaling
             next_token_logits = next_token_logits / temperature
 
-            # Top-K Filtering
+            # Top-K & P Filtering
             next_token_logits = self.top_k_filtering(next_token_logits, top_k=top_k)
-
-            # Convert to probabilities
-            probs = F.softmax(next_token_logits, dim=-1)
+            probs = self.top_p_filtering(next_token_logits, p=top_p)
 
             # Sample
             next_tokens = torch.multinomial(probs, num_samples=1)
 
-            if [self.eos_token_id] in next_tokens.tolist():
+            # Update which sequences in the batch have hit EOS on the last codebook
+            has_eos = next_tokens[:, -1] == self.eos_token_id
+            unfinished_sequences = unfinished_sequences.masked_fill(has_eos, False)
+
+            # Only break when ALL sequences in the batch have output EOS
+            if not unfinished_sequences.any():
                 break
 
             # Append the newly generated tokens to the sequence
