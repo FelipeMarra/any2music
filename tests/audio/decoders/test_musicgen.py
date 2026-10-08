@@ -125,7 +125,7 @@ def test_musicgen_encodec():
     for update in range(1, UPDATES+1):
         optim.zero_grad()
 
-        logits = model(src=None, tgt=input_tokens)
+        logits, _ = model(src=None, tgt=input_tokens)
 
         # Reshape for CrossEntropyLoss
         # Logits: (B, K, S, Vocab) -> (B * K * S, Vocab)
@@ -147,8 +147,8 @@ def test_musicgen_encodec():
         src=None,
         batch_size=UNCOND_GEN_B_SIZE,
         max_new_tokens=model.max_seq_len,
-        temperature=1e-4, # < 1 -> eliminate randomness | = 1 -> the distribution learned | > 1 -> aproximate a uniform distribution
-        top_k=1
+        temperature=1.0, # < 1. -> eliminate randomness | = 1. -> the distribution learned | > 1. -> aproximate a uniform distribution
+        top_k=32
     )
 
     # Decode back to audio
@@ -163,7 +163,7 @@ def test_musicgen_encodec():
         decoded_audio_b = decoded_audio[b, :, :valid_samples]
         print(f"(test_musicgen_encodec) Decoded audio Afeter Filter Valid: {decoded_audio_b.shape}")
 
-        save_audio("test_musicgen_encodec.wav", decoded_audio_b.squeeze(0).cpu(), sample_rate=encodec.sample_rate)
+        save_audio("test_musicgen_encodec.wav", decoded_audio_b.cpu(), sample_rate=encodec.sample_rate)
 
     # TODO: KLD between the first 15s of the original song and the generated 15s -> should be a veeery small value
 
@@ -195,7 +195,7 @@ def test_musicgen_dac():
     for update in range(1, UPDATES+1):
         optim.zero_grad()
 
-        logits = model(src=None, tgt=input_tokens)
+        logits, _ = model(src=None, tgt=input_tokens)
 
         # Reshape for CrossEntropyLoss
         # Logits: (B, K, S, Vocab) -> (B * K * S, Vocab)
@@ -218,8 +218,8 @@ def test_musicgen_dac():
             src=None,
             batch_size=UNCOND_GEN_B_SIZE,
             max_new_tokens=model.max_seq_len,
-            temperature=1e-4, # < 1 -> eliminate randomness | = 1 -> the distribution learned | > 1 -> aproximate a uniform distribution
-            top_k=1
+            temperature=1.0, # < 1 -> eliminate randomness | = 1 -> the distribution learned | > 1 -> aproximate a uniform distribution
+            top_k=32
         )
 
     print(f"(test_musicgen_dac) Generate audio codes shape: {audio_tokens.shape}\n")
@@ -244,7 +244,7 @@ def test_musicgen_t5_dac():
     dec_size = MUSICGEN_SIZES["test"]
     t5 = T5Conditioner('t5-base', dec_size.d_model, device='cuda').cuda()
 
-    conditioners_txt = ["NES", "SUPER", "JAMENDO"]
+    conditioners_txt = ["NES", "SUPER NINTENDO", "MTG JAMENDO DATASET"]
 
     # Tokenize in a single batch to automatically handle padding alignment
     t5_inputs = t5.tokenize(conditioners_txt) # type: ignore
@@ -253,8 +253,8 @@ def test_musicgen_t5_dac():
 
     conditioners = conditioners.to(torch.bfloat16)
     src_mask = src_mask.to(torch.bfloat16)
-    src_mask = ~src_mask.bool() if src_mask.dtype == torch.bool else (src_mask == 0)
 
+    print(f"test_musicgen_t5_dac src_mask: {src_mask}")
     print(f"(test_musicgen_t5_dac) Conditioners shape {conditioners.shape}")
 
     del t5
@@ -291,7 +291,7 @@ def test_musicgen_t5_dac():
     model.train()
     for update in range(1, UPDATES+1):
         optim.zero_grad()
-        logits = model(src=conditioners, tgt=model_inputs)
+        logits, _ = model(src=conditioners, tgt=model_inputs)
 
         # Reshape for CrossEntropyLoss
         flat_logits = logits.reshape(-1, model.vocab_size)
@@ -312,8 +312,8 @@ def test_musicgen_t5_dac():
             src=conditioners,
             src_mask=src_mask,
             max_new_tokens=model.max_seq_len,
-            temperature=1e-4, # < 1 -> eliminate randomness | = 1 -> the distribution learned | > 1 -> aproximate a uniform distribution
-            top_k=1
+            temperature=1.0, # < 1. -> eliminate randomness | = 1. -> the distribution learned | > 1. -> aproximate a uniform distribution
+            top_k=32
         )
 
         print(f"(test_musicgen_t5_dac) Generated audio codes shape: {audio_tokens.shape}\n")

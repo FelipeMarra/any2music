@@ -1,4 +1,5 @@
 import math
+import logging
 import typing as tp
 from enum import Enum
 from dataclasses import dataclass
@@ -9,16 +10,8 @@ import torch.nn.functional as F
 
 from any2music.base import BaseDecoder
 
-# To unsderstand how they model it on hf go to
-# from transformers import MusicgenForConditionalGeneration
-# Which uses 
-# from transformers import MusicgenForCausalLM
-# As the decoder
-# Which uses
-# from transformers import MusicgenModel
-# As its base model
-# Which uses MusicgenDecoder as its decoder
-# Which is a ModuleList of MusicgenDecoderLayer
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 #########################################################
 # Model Size Hyperparameters
@@ -37,57 +30,13 @@ class MusicGenSizeValues():
     num_decoder_layers: int
 
 MUSICGEN_SIZES:tp.Dict[str, MusicGenSizeValues] = {
-    "test": MusicGenSizeValues(d_model=1024, nhead=16, num_decoder_layers=12), # 3213MiB
+    "test": MusicGenSizeValues(d_model=1024, nhead=16, num_decoder_layers=12),
     "small": MusicGenSizeValues(d_model=1024, nhead=16, num_decoder_layers=24)
 }
 
 #########################################################
-# Transformer Layer Components
+# Delay Provider
 #########################################################
-
-# Class obtained from https://github.com/huggingface/transformers/blob/10555512868d663ee1ff627e4f5c5c260114235b/src/transformers/models/musicgen/modeling_musicgen.py#L106
-class MusicgenSinusoidalPositionalEmbedding(nn.Module):
-    """This module produces sinusoidal positional embeddings of any length."""
-
-    def __init__(self, num_positions: int, embedding_dim: int, dtype = torch.bfloat16):
-        super().__init__()
-        self.dtype = dtype
-        self.embedding_dim = embedding_dim
-        self.num_positions = num_positions
-        self.make_weights(num_positions, embedding_dim)
-
-    def make_weights(self, num_embeddings: int, embedding_dim: int):
-        emb_weights = self.get_embedding(num_embeddings, embedding_dim)
-        if hasattr(self, "weights"):
-            # in forward put the weights on the correct dtype and device of the param
-            emb_weights = emb_weights.to(dtype=self.weights.dtype, device=self.weights.device) # type: ignore
-
-        self.register_buffer("weights", emb_weights, persistent=False)
-
-    def get_embedding(self, num_embeddings: int, embedding_dim: int):
-        """
-        Build sinusoidal embeddings. This matches the implementation in tensor2tensor, but differs slightly from the
-        description in Section 3.5 of "Attention Is All You Need".
-        """
-        half_dim = embedding_dim // 2
-        emb = math.log(10_000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, dtype=torch.int64).float() * -emb)
-        emb = torch.arange(num_embeddings, dtype=torch.int64).float().unsqueeze(1) * emb.unsqueeze(0)
-        emb = torch.cat([torch.cos(emb), torch.sin(emb)], dim=1).view(num_embeddings, -1)
-        if embedding_dim % 2 == 1:
-            # zero pad
-            emb = torch.cat([emb, torch.zeros(num_embeddings, 1)], dim=1)
-        return emb.to(self.dtype)
-
-    @torch.no_grad()
-    def forward(self, input_ids: torch.Tensor, past_key_values_length: int = 0):
-        _, _, seq_len = input_ids.size() # expects batch, codebooks, seq_len
-        # Create the position ids from the input token ids.
-        position_ids = (torch.arange(seq_len) + past_key_values_length).to(input_ids.device)
-        # expand embeddings if needed
-        if seq_len > self.weights.size(0): # type: ignore
-            self.make_weights(seq_len, self.embedding_dim)
-        return self.weights.index_select(0, position_ids.view(-1)).detach() # type: ignore
 
 # Methods obtained from https://github.com/huggingface/transformers/blob/70257e9a3c2bfc7f7dda308836adc4ad561610b7/src/transformers/models/musicgen/modeling_musicgen.py#L813
 class DelayProvider():
@@ -123,7 +72,6 @@ class DelayProvider():
         channel_codebooks = K // 2 if audio_channels == 2 else K
         # we only apply the mask if we have a large enough seq len - otherwise we return as is
         if max_length < 2 * channel_codebooks - 1:
-            # return input_ids.reshape(bsz * num_codebooks, -1), input_ids_shifted.reshape(bsz * num_codebooks, -1)
             return input_ids, input_ids_shifted
 
         # fill the shifted ids with the prompt entries, offset by the codebook idx
@@ -143,7 +91,7 @@ class DelayProvider():
         )
         # then fill the lower triangular part (the BOS padding)
         # delay_pattern = delay_pattern + torch.tril(torch.ones((channel_codebooks, max_length), dtype=torch.bool))
-        delay_pattern = delay_pattern | torch.tril(torch.ones((channel_codebooks, max_length), dtype=torch.bool), diagonal=-1)
+        delay_pattern = delay_pattern | torch.tril(torch.ones((channel_codebooks, max_length), dtype=torch.bool), diagonal=0)
 
         if audio_channels == 2:
             # for left/right channel we need to duplicate every row of the pattern mask in an interleaved fashion
@@ -162,9 +110,6 @@ class DelayProvider():
             # we have no tokens that need to be filled - return entire matrix of input ids
             first_start_id = S
 
-        # (bsz * num_codebooks, seq_len) -> (bsz, num_codebooks, seq_len)
-        # pattern_mask = input_ids.reshape(bsz * num_codebooks, -1)
-        # input_ids = input_ids[..., :first_start_id].reshape(bsz * num_codebooks, -1)
         pattern_mask = input_ids
         input_ids = input_ids[..., :first_start_id]
         return input_ids, pattern_mask
@@ -187,8 +132,6 @@ class DelayProvider():
         generated_ids shape: (Batch, Codebooks, SequenceLength)
         """
         B, K, S = generated_ids.shape
-
-        # The valid sequence length is reduced by the maximum delay (K - 1)
         valid_length = S - (K - 1)
 
         if valid_length <= 0:
@@ -197,34 +140,203 @@ class DelayProvider():
         aligned_ids = torch.zeros((B, K, valid_length), dtype=generated_ids.dtype, device=generated_ids.device)
 
         for codebook_idx in range(K):
-            # Shift each codebook back by its respective delay offset
             start_idx = codebook_idx
             end_idx = start_idx + valid_length
             aligned_ids[:, codebook_idx, :] = generated_ids[:, codebook_idx, start_idx:end_idx]
 
         return aligned_ids
 
-#########################################################
-# Transformer Layers
-#########################################################
 
-def get_musicgen_decoder(
-        model_size:MusicGenSize=MusicGenSize.SMALL,
-        dtype=torch.bfloat16
-    ) -> nn.TransformerDecoderLayer:
+class MusicgenSinusoidalPositionalEmbedding(nn.Module):
+    def __init__(self, num_positions: int, embedding_dim: int, dtype = torch.bfloat16):
+        super().__init__()
+        self.dtype = dtype
+        self.embedding_dim = embedding_dim
+        self.num_positions = num_positions
+        self.make_weights(num_positions, embedding_dim)
 
-    size_params = MUSICGEN_SIZES[model_size.value]
+    def make_weights(self, num_embeddings: int, embedding_dim: int):
+        emb_weights = self.get_embedding(num_embeddings, embedding_dim)
+        if hasattr(self, "weights"):
+            emb_weights = emb_weights.to(dtype=self.weights.dtype, device=self.weights.device)
+        self.register_buffer("weights", emb_weights, persistent=False)
 
-    return nn.TransformerDecoderLayer(
-        d_model=size_params.d_model,
-        nhead=size_params.nhead,
-        activation=torch.nn.GELU(),
-        dim_feedforward=size_params.d_model * 4,
-        dropout=0.1,
-        norm_first=True,
-        batch_first=True,
-        dtype=dtype
-    )
+    def get_embedding(self, num_embeddings: int, embedding_dim: int):
+        half_dim = embedding_dim // 2
+        emb = math.log(10_000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, dtype=torch.int64).float() * -emb)
+        emb = torch.arange(num_embeddings, dtype=torch.int64).float().unsqueeze(1) * emb.unsqueeze(0)
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1).view(num_embeddings, -1)
+        if embedding_dim % 2 == 1:
+            emb = torch.cat([emb, torch.zeros(num_embeddings, 1)], dim=1)
+        return emb.to(self.dtype)
+
+    @torch.no_grad()
+    def forward(self, input_ids: torch.Tensor, past_key_values_length: int = 0):
+        _, _, seq_len = input_ids.size() 
+        position_ids = (torch.arange(seq_len) + past_key_values_length).to(input_ids.device)
+        
+        # TODO was: if seq_len > self.weights.size(0): # type: ignore
+        target_len = seq_len + past_key_values_length
+        if target_len > self.weights.size(0): # type: ignore
+            self.make_weights(target_len, self.embedding_dim)
+            
+        return self.weights.index_select(0, position_ids.view(-1)).detach() # type: ignore
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, d_model, n_heads, dtype=torch.bfloat16):
+        super().__init__()
+
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+
+        self.w_q = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
+        self.w_k = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
+        self.w_v = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
+        self.w_out = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
+
+
+    def forward(self, x, tgt_mask, past_kv=None):
+        B, S, D = x.shape
+
+        # q, k and v will be (B, n_heads, S, head_size)
+        q = self.w_q(x).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.w_k(x).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.w_v(x).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+
+        present_kv = (k, v)
+
+        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=tgt_mask)
+        attn = attn.transpose(1, 2).reshape(B, S, D)
+
+        return self.w_out(attn), present_kv
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, d_model, n_heads, dtype=torch.bfloat16):
+        super().__init__()
+
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+
+        self.w_q = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
+        self.w_k = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
+        self.w_v = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
+        self.w_out = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
+
+
+    def forward(self, x, memory, memory_mask=None, past_kv=None):
+        B, S, D = x.shape
+
+        # B, self.n_heads, S, self.head_dim
+        q = self.w_q(x).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+
+        if past_kv is None:
+            B_m, S_m, _ = memory.shape
+
+            # B_m, self.n_heads, S_m, self.head_dim
+            k = self.w_k(memory).view(B_m, S_m, self.n_heads, self.head_dim).transpose(1, 2)
+            v = self.w_v(memory).view(B_m, S_m, self.n_heads, self.head_dim).transpose(1, 2)
+
+            present_kv = (k, v)
+        else:
+            k, v = past_kv
+            present_kv = past_kv
+
+        attn_mask = None
+        if memory_mask is not None:
+            attn_mask = memory_mask.view(B, 1, 1, -1)
+
+        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        attn = attn.transpose(1, 2).reshape(B, S, D)
+        return self.w_out(attn), present_kv
+
+
+class MusicGenDecoderLayer(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, dim_feedforward: int, dropout: float = 0.1, dtype=torch.bfloat16):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+
+        assert d_model % n_heads == 0
+
+        # Attention
+        self.self_att = CausalSelfAttention(d_model, n_heads, dtype)
+        self.cross_att = CrossAttention(d_model, n_heads, dtype)
+
+        # Feedforward
+        self.linear1 = nn.Linear(d_model, dim_feedforward, dtype=dtype)
+        self.linear2 = nn.Linear(dim_feedforward, d_model, dtype=dtype)
+        self.activation = nn.GELU()
+
+        # Norms & Dropout
+        self.norm1 = nn.LayerNorm(d_model, dtype=dtype)
+        self.norm2 = nn.LayerNorm(d_model, dtype=dtype)
+        self.norm3 = nn.LayerNorm(d_model, dtype=dtype)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self, 
+        tgt: torch.Tensor, 
+        memory: torch.Tensor, 
+        tgt_mask: tp.Optional[torch.Tensor] = None, 
+        memory_mask: tp.Optional[torch.Tensor] = None,
+        layer_past_kv: tp.Optional[dict] = None
+    ):
+        if layer_past_kv is None:
+            layer_past_kv = {'self': None, 'cross': None}
+
+        # Self-Attention 
+        norm_tgt = self.norm1(tgt)
+        out, present_self_kv = self.self_att(x=norm_tgt, tgt_mask=tgt_mask, past_kv=layer_past_kv['self'])
+        tgt = tgt + self.dropout(out)
+
+        # Cross-Attention
+        norm_tgt = self.norm2(tgt)
+        out, present_cross_kv = self.cross_att(x=norm_tgt, memory=memory, memory_mask=memory_mask, past_kv=layer_past_kv['cross'])
+        tgt = tgt + self.dropout(out)
+
+        # Feedforward
+        norm_tgt = self.norm3(tgt)
+        ff_out = self.linear2(self.dropout(self.activation(self.linear1(norm_tgt))))
+        tgt = tgt + self.dropout(ff_out)
+
+        new_layer_kv = {'self': present_self_kv, 'cross': present_cross_kv}
+        return tgt, new_layer_kv
+
+
+class MusicGenDecoder(nn.Module):
+    def __init__(self, layers: nn.ModuleList, norm: nn.Module):
+        super().__init__()
+        self.layers = layers
+        self.norm = norm
+
+    def forward(self, tgt, memory, tgt_mask=None, memory_mask=None, past_kv=None):
+        """
+            MusicGen Decoder's forward
+
+            memory_mask: The same logic as HuggingFace T5, that is, 1 for sequence and 0 for padding 
+        """
+        if past_kv is None:
+            past_kv = [None] * len(self.layers)
+
+        new_kv = []
+        for layer, layer_past in zip(self.layers, past_kv):
+            tgt, new_layer_kv = layer(tgt, memory, tgt_mask=tgt_mask, memory_mask=memory_mask, layer_past_kv=layer_past)
+            new_kv.append(new_layer_kv)
+
+        if self.norm is not None:
+            tgt = self.norm(tgt)
+
+        return tgt, new_kv
+
 
 #########################################################
 # MusicGen Transformer
@@ -241,8 +353,12 @@ class MusicGenTransformer(BaseDecoder):
             audio_duration:int,
             encoder:tp.Optional[nn.TransformerEncoder] = None,
             model_size:MusicGenSize=MusicGenSize.SMALL, 
-            dtype:torch.dtype=torch.bfloat16
+            dtype:torch.dtype=torch.bfloat16,
+            invert_src_mask=False
         ):
+        """
+            src/memory mask: True or 1 means valid token & False or 0 means a masked token
+        """
         super().__init__()
         self.size_params = MUSICGEN_SIZES[model_size.value]
         self.vocab_size = vocab_size
@@ -250,84 +366,91 @@ class MusicGenTransformer(BaseDecoder):
         self.eos_token_id = eos_token_id
         self.bos_token_id = bos_token_id
         self.num_codebooks = 4
-        self.max_seq_len = frame_rate*audio_duration+self.num_codebooks+5 # frame_rate * audio_duration + num_codebooks (for the delay_pattern) + BOS + EOS + 3 paddings
+        self.max_seq_len = frame_rate * audio_duration + self.num_codebooks + 5
         self.dtype = dtype
+        self.invert_src_mask = invert_src_mask
 
-        # Separate embedding layers for each codebook
         self.dec_embedding_layers = nn.ModuleList([
             nn.Embedding(self.vocab_size, self.size_params.d_model, dtype=self.dtype) for _ in range(self.num_codebooks)
         ])
         self.pos_embedding = MusicgenSinusoidalPositionalEmbedding(num_positions=self.max_seq_len, embedding_dim=self.size_params.d_model)
 
-        # Explicit Encoder-Decoder Setup
         self.encoder = encoder
 
-        dec_layer = get_musicgen_decoder(model_size=model_size, dtype=self.dtype)
-
-        # Add a final LayerNorm to stabilize the output before the LM heads
+        dec_layers = nn.ModuleList([
+            MusicGenDecoderLayer(
+                d_model=self.size_params.d_model,
+                n_heads=self.size_params.nhead,
+                dim_feedforward=self.size_params.d_model * 4,
+                dropout=0.1,
+                dtype=self.dtype
+            ) for _ in range(self.size_params.num_decoder_layers)
+        ])
+        
         final_norm = nn.LayerNorm(self.size_params.d_model, dtype=self.dtype)
+        self.decoder = MusicGenDecoder(layers=dec_layers, norm=final_norm)
 
-        self.decoder = nn.TransformerDecoder(
-            dec_layer, 
-            norm=final_norm,
-            num_layers=self.size_params.num_decoder_layers
-        )
-
-        # One classification head for each codebook
         self.lm_heads = nn.ModuleList([
             nn.Linear(self.size_params.d_model, self.vocab_size, dtype=self.dtype) for _ in range(self.num_codebooks)
         ])
 
-        # CFT learnable "null" context vector representing the absence of conditioning
-        self.null_memory = nn.Parameter(torch.randn(1, 1, self.size_params.d_model, dtype=self.dtype)) # (1 batch, 1 seq_len, d_model)
+        self.null_memory = nn.Parameter(torch.randn(1, 1, self.size_params.d_model, dtype=self.dtype))
 
-    def forward(self, src, tgt, drop_conditioning=False, src_mask=None):
+
+    def forward(self, src, tgt, drop_conditioning=False, src_mask=None, past_kv=None, pos_offset:int=0, pre_comp_src=False):
+        """
+            src/memory mask: True or 1 means valid token & False or 0 means a masked token
+        """
         B, K, S = tgt.shape
-        # print(f"\nTarget shape: {tgt.shape}\n")
-        #if src is not None: print(f"Src shape: {src.shape}\n")
 
-        # CFG condition routing
-        ## Conditional path: Run standard encoder
-        if src is not None and self.encoder is not None and not drop_conditioning:
-            memory, memory_mask = self.encoder(src)
-            # print(f"Memory came from encoder with shape: {memory.shape}\n")
-
-        ## Unconditional path: Broadcast the learned null token across the batch
-        elif self.encoder is None and src is None or drop_conditioning:
-            memory = self.null_memory.expand(B, 1, -1)
-            memory_mask = None
-            # print(f"Memory is null, with shape: {memory.shape}\n")
-
-        ## Conditional path when the src comes already encoded 
-        elif src is not None and self.encoder is None and not drop_conditioning:
+        if pre_comp_src:
             memory = src
             memory_mask = src_mask
-            # print(f"Memory came ready w/o need to encode: {memory.shape}\n")
+        else:
+            if (src is not None) and (self.encoder is not None) and (not drop_conditioning):
+                memory, memory_mask = self.encoder(src)
+            elif (self.encoder is None) and (src is None) or drop_conditioning:
+                memory = self.null_memory.expand(B, 1, -1)
+                memory_mask = None
+            elif(src is not None) and (self.encoder is None) and (not drop_conditioning): # pre_comp_src is False but matches an equivalent condition
+                memory = src
+                memory_mask = src_mask
+
+        # in the T5 memory_mask False means sequence, and for SDPA true means sequence and false means padding
+        if memory_mask is not None:
+            if memory_mask.dtype != torch.bool:
+                memory_mask = memory_mask == 1
+
+            if self.invert_src_mask:
+                memory_mask = ~memory_mask
 
         # Get embeddings per codebook
-        # TODO: Am I accumulating the codebooks embeddings????
         dec_embs = torch.zeros(B, S, self.size_params.d_model, device=tgt.device, dtype=self.dtype)
         for i in range(K):
             dec_embs += self.dec_embedding_layers[i](tgt[:, i, :])
 
-        # Scale and positional embedding
-        dec_embs = dec_embs * math.sqrt(self.size_params.d_model) + self.pos_embedding(tgt).to(self.dtype)
-        # print(f"Got decoder embedings with shape: {dec_embs.shape}\n")
+        # Handle Positional Embeddings with offset for single-token generation
+        end = pos_offset + S
+        if end > self.pos_embedding.weights.size(0):
+            self.pos_embedding.make_weights(end, self.pos_embedding.embedding_dim)
 
-        # Causal mask
-        tgt_mask = nn.Transformer.generate_square_subsequent_mask(S, device=tgt.device).to(self.dtype)
-        # print(f"Got target mask with shape: {dec_embs.shape}")
-        # print(f"Target mask:\n{tgt_mask}\n")
+        pos_emb = self.pos_embedding.weights[pos_offset : end].to(self.dtype)  # (S, D)
+        dec_embs = dec_embs * math.sqrt(self.size_params.d_model) + pos_emb
 
-        out = self.decoder(tgt=dec_embs, memory=memory, tgt_mask=tgt_mask, memory_key_padding_mask=memory_mask)
-        #print(f"Got decoder output with shape:{out.shape}\n")
-        # print(f"Got decoder output:\n{out}\n")
+        tgt_mask = None
+        if S > 1:
+            tgt_mask = nn.Transformer.generate_square_subsequent_mask(S, device=tgt.device).to(self.dtype)
 
-        # Inference on the codebook heads
+        out, new_kv = self.decoder(
+            tgt=dec_embs, 
+            memory=memory, 
+            tgt_mask=tgt_mask, 
+            memory_mask=memory_mask,
+            past_kv=past_kv
+        )
+
         logits = torch.stack([head(out) for head in self.lm_heads], dim=1)
-        # print(f"Got logits with shape:{logits.shape}\n")
-
-        return logits
+        return logits, new_kv
 
 
     def top_k_filtering(self, logits: torch.Tensor, top_k: int = 250, filter_value: float = -float("Inf")):
@@ -377,41 +500,53 @@ class MusicGenTransformer(BaseDecoder):
         temperature: float = 1.0,
         top_k: int = 250,
         top_p=0.90,
-        cfg_scale: float = 3.0 # Added CFG weight
+        cfg_scale: float = 3.0
     ):
+
+        assert max_new_tokens <= self.max_seq_len
+
         self.eval()
         device = next(self.parameters()).device
         B = src.shape[0] if src is not None else batch_size
         K = self.num_codebooks
 
-        # Initialize tgt exactly like the delayed training data (step 0)
+        # Initial prompt tokens (shape B, K, 2)
         tgt = torch.full((B, K, 2), self.pad_token_id, dtype=torch.long, device=device)
         tgt[:, 0, 1] = self.bos_token_id
 
-        unfinished_sequences = torch.ones(B, dtype=torch.bool, device=device)
-        for step in range(max_new_tokens):
-            # Implement CFG with a dual forward pass
-            if src is not None:
-                logits_cond = self(src=src, tgt=tgt, src_mask=src_mask)
-                logits_uncond = self(src=None, tgt=tgt, drop_conditioning=True)
-                logits = logits_uncond + cfg_scale * (logits_cond - logits_uncond)
+        # Init conditioning
+        if src is not None:
+            if self.encoder is not None:
+                memory, memory_mask = self.encoder(src)
             else:
-                logits = self(src=None, tgt=tgt, drop_conditioning=True)
+                memory, memory_mask = src, src_mask
+        else:
+            memory, memory_mask = None, None
 
-            next_token_logits = logits[:, :, -1, :]
+        # Initial sequence (length 2) to initialize KV caches
+        if src is not None:
+            logits_cond, kv_cond = self(src=memory, tgt=tgt, src_mask=memory_mask, past_kv=None, pre_comp_src=True)
+            logits_uncond, kv_uncond = self(src=None, tgt=tgt, drop_conditioning=True, past_kv=None)
+            logits = logits_uncond + cfg_scale * (logits_cond - logits_uncond)
+        else:
+            logits, kv_uncond = self(src=None, tgt=tgt, drop_conditioning=True, past_kv=None)
+            kv_cond = None
 
-            # Loop logic to force delayed BOS and PAD tokens
+        next_token_logits = logits[:, :, -1, :]
+
+        # Incremental Decoding Loop
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
+
+        for step in range(max_new_tokens):
             for k in range(K):
                 if step < k:
                     mask = torch.ones(self.vocab_size, dtype=torch.bool, device=device)
-                    # We force BOS exactly one step before the codebook starts outputting audio
                     if step == k - 1:
                         mask[self.bos_token_id] = False
                     else:
                         mask[self.pad_token_id] = False
                     next_token_logits[:, k, mask] = -float("inf")
                 else:
-                    # Prevent padding and bos token once audio generation has started
                     next_token_logits[:, k, self.pad_token_id] = -float("inf")
                     next_token_logits[:, k, self.bos_token_id] = -float("inf")
 
@@ -421,33 +556,44 @@ class MusicGenTransformer(BaseDecoder):
 
             probs_flat = probs.view(B * K, -1)
             next_tokens_flat = torch.multinomial(probs_flat, num_samples=1)
-            next_tokens = next_tokens_flat.view(B, K, 1)
+            next_tokens = next_tokens_flat.view(B, K, 1) # Shape: (B, K, 1)
 
-            # Check which sequences hit EOS THIS step
-            has_eos = next_tokens[:, K-1, 0] == self.eos_token_id
+            # Logic for sequences in the batch that already finisehed
+            eos_hit = (next_tokens[:, K - 1, 0] == self.eos_token_id) # (B,)
+            newly_finished = eos_hit & ~finished
 
-            # Force sequences that ALREADY finished in previous steps to output padding.
-            # (~unfinished_sequences identifies batches that are already done).
-            next_tokens[~unfinished_sequences, :, :] = self.pad_token_id
+            # Mask rows that were already finished with eos to trigger valid_mask later
+            already_finished = finished.clone()
+            if already_finished.any():
+                next_tokens[already_finished] = self.eos_token_id
+
+            # Update finished mask
+            finished |= newly_finished
 
             tgt = torch.cat([tgt, next_tokens], dim=-1)
 
-            # Update the global tracker for the NEXT step
-            unfinished_sequences = unfinished_sequences.masked_fill(has_eos, False)
-
-            # Only break when ALL sequences in the batch have output EOS
-            if not unfinished_sequences.any():
+            if finished.all():
                 break
 
-        # Realign the codebooks to fix the delay pattern offset
-        aligned_audio_tokens = DelayProvider.revert_delay_pattern(tgt)
+            # Step forward with ONLY the single newest token (length 1)
+            pos_offset = tgt.shape[-1] - 1
+            if src is not None:
+                logits_cond, kv_cond = self(src=memory, tgt=next_tokens, src_mask=memory_mask, past_kv=kv_cond, pos_offset=pos_offset, pre_comp_src=True)
+                logits_uncond, kv_uncond = self(src=None, tgt=next_tokens, drop_conditioning=True, past_kv=kv_uncond, pos_offset=pos_offset)
+                logits = logits_uncond + cfg_scale * (logits_cond - logits_uncond)
+            else:
+                logits, kv_uncond = self(src=None, tgt=next_tokens, drop_conditioning=True, past_kv=kv_uncond, pos_offset=pos_offset)
 
-        # The first frame of the realigned tokens is always the BOS token; slice it out
+            next_token_logits = logits[:, :, -1, :]
+
+        aligned_audio_tokens = DelayProvider.revert_delay_pattern(tgt)
         aligned_audio_tokens = aligned_audio_tokens[:, :, 2:]
 
-        # In generate(): calculate frame counts before applying safety mask
-        valid_mask = (aligned_audio_tokens >= 0) & (aligned_audio_tokens < self.pad_token_id)
+        invalid_mask = (aligned_audio_tokens < 0) | (aligned_audio_tokens >= self.eos_token_id)
+
+        valid_mask = (aligned_audio_tokens >= 0) & (aligned_audio_tokens < self.eos_token_id)
         valid_lengths = valid_mask.all(dim=1).sum(dim=-1) # Shape: (B,)
 
-        aligned_audio_tokens[~valid_mask] = 0
+        aligned_audio_tokens[invalid_mask] = 0
+
         return aligned_audio_tokens, valid_lengths
