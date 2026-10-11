@@ -353,8 +353,7 @@ class MusicGenTransformer(BaseDecoder):
             audio_duration:int,
             encoder:tp.Optional[nn.TransformerEncoder] = None,
             model_size:MusicGenSize=MusicGenSize.SMALL, 
-            dtype:torch.dtype=torch.bfloat16,
-            invert_src_mask=False
+            dtype:torch.dtype=torch.bfloat16
         ):
         """
             src/memory mask: True or 1 means valid token & False or 0 means a masked token
@@ -368,7 +367,6 @@ class MusicGenTransformer(BaseDecoder):
         self.num_codebooks = 4
         self.max_seq_len = frame_rate * audio_duration + self.num_codebooks + 5
         self.dtype = dtype
-        self.invert_src_mask = invert_src_mask
 
         self.dec_embedding_layers = nn.ModuleList([
             nn.Embedding(self.vocab_size, self.size_params.d_model, dtype=self.dtype) for _ in range(self.num_codebooks)
@@ -416,25 +414,18 @@ class MusicGenTransformer(BaseDecoder):
                 memory = src
                 memory_mask = src_mask
 
-        # in the T5 memory_mask False means sequence, and for SDPA true means sequence and false means padding
+        # in the T5 memory_mask True means sequence, and for SDPA true means sequence and false means padding
         if memory_mask is not None:
             if memory_mask.dtype != torch.bool:
                 memory_mask = memory_mask == 1
-
-            if self.invert_src_mask:
-                memory_mask = ~memory_mask
 
         # Get embeddings per codebook
         dec_embs = torch.zeros(B, S, self.size_params.d_model, device=tgt.device, dtype=self.dtype)
         for i in range(K):
             dec_embs += self.dec_embedding_layers[i](tgt[:, i, :])
 
-        # Handle Positional Embeddings with offset for single-token generation
-        end = pos_offset + S
-        if end > self.pos_embedding.weights.size(0):
-            self.pos_embedding.make_weights(end, self.pos_embedding.embedding_dim)
-
-        pos_emb = self.pos_embedding.weights[pos_offset : end].to(self.dtype)  # (S, D)
+        # Pass the integer pos_offset which correctly represents the past sequence length
+        pos_emb = self.pos_embedding(input_ids=tgt, past_key_values_length=pos_offset).to(self.dtype)  # (S, D)
         dec_embs = dec_embs * math.sqrt(self.size_params.d_model) + pos_emb
 
         tgt_mask = None
@@ -515,13 +506,13 @@ class MusicGenTransformer(BaseDecoder):
         tgt[:, 0, 1] = self.bos_token_id
 
         # Init conditioning
+        memory, memory_mask = None, None
+
         if src is not None:
             if self.encoder is not None:
                 memory, memory_mask = self.encoder(src)
             else:
                 memory, memory_mask = src, src_mask
-        else:
-            memory, memory_mask = None, None
 
         # Initial sequence (length 2) to initialize KV caches
         if src is not None:

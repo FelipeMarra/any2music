@@ -1,8 +1,9 @@
-import random
-import torch
 import typing as tp
 
+import torch
 from torchaudio import save as save_audio
+from torch.utils.data import Dataset, DataLoader
+
 
 from audiotools import AudioSignal
 from any2music.audio.tokenizers import HFEncodecCompressionModel
@@ -239,22 +240,80 @@ def test_musicgen_dac():
     # TODO: KLD between the first 15s of the original song and the generated 15s -> should be a veeery small value
 
 
+#########################################
+# T5 + Musicgen w/ DAC
+#########################################
+
+class TextAudioTokenDataset(Dataset):
+    """
+    Holds pre-computed T5 conditioning + DAC tokens for each (text, audio) pair.
+    All tensors are expected to already be on-device and have a leading batch dim
+    of size N (we slice on dim 0).
+    """
+    def __init__(self, texts, conditioners, src_mask, input_tokens, target_tokens, metas):
+        self.texts = list(texts)
+        self.conditioners = conditioners
+        self.src_mask = src_mask
+        self.input_tokens = input_tokens
+        self.target_tokens = target_tokens
+        self.metas = list(metas)
+
+        n = len(self.texts)
+        assert self.conditioners.shape[0] == n
+        assert self.input_tokens.shape[0] == n
+        assert self.target_tokens.shape[0] == n
+        assert len(self.metas) == n
+        if self.src_mask is not None:
+            assert self.src_mask.shape[0] == n
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        return {
+            "text": self.texts[idx],
+            "conditioner": self.conditioners[idx],
+            "src_mask": self.src_mask[idx] if self.src_mask is not None else None,
+            "input_tokens": self.input_tokens[idx],
+            "target_tokens": self.target_tokens[idx],
+            "meta": self.metas[idx],
+        }
+
+
+def collate_audio_text(batch):
+    texts = [b["text"] for b in batch]
+    conditioners = torch.stack([b["conditioner"] for b in batch], dim=0)
+
+    if batch[0]["src_mask"] is not None:
+        src_mask = torch.stack([b["src_mask"] for b in batch], dim=0)
+    else:
+        src_mask = None
+
+    input_tokens = torch.stack([b["input_tokens"] for b in batch], dim=0)
+    target_tokens = torch.stack([b["target_tokens"] for b in batch], dim=0)
+    metas = [b["meta"] for b in batch]
+
+    return texts, conditioners, src_mask, input_tokens, target_tokens, metas
+
+
 def test_musicgen_t5_dac():
+    batch_size = 1
+    num_workers = 0
+
     # T5
     dec_size = MUSICGEN_SIZES["test"]
-    t5 = T5Conditioner('t5-base', dec_size.d_model, device='cuda').cuda()
+    t5 = T5Conditioner("t5-base", dec_size.d_model, device="cuda").cuda()
 
     conditioners_txt = ["NES", "SUPER NINTENDO", "MTG JAMENDO DATASET"]
 
-    # Tokenize in a single batch to automatically handle padding alignment
-    t5_inputs = t5.tokenize(conditioners_txt) # type: ignore
+    t5_inputs = t5.tokenize(conditioners_txt)  # type: ignore
     with torch.no_grad():
         conditioners, src_mask = t5(t5_inputs)
 
     conditioners = conditioners.to(torch.bfloat16)
     src_mask = src_mask.to(torch.bfloat16)
 
-    print(f"test_musicgen_t5_dac src_mask: {src_mask}")
+    print(f"test_musicgen_t5_dac src_mask:\n{src_mask}")
     print(f"(test_musicgen_t5_dac) Conditioners shape {conditioners.shape}")
 
     del t5
@@ -263,6 +322,7 @@ def test_musicgen_t5_dac():
     # DAC
     dac = DACCompressionModel.get_pretrained("44khz")
     dac.set_num_codebooks(4)
+
     model = MusicGenTransformer(
         vocab_size=dac.vocab_size,
         pad_token_id=dac.pad_token_id,
@@ -270,50 +330,79 @@ def test_musicgen_t5_dac():
         bos_token_id=dac.bos_token_id,
         frame_rate=int(dac.frame_rate),
         audio_duration=TEST_SECs,
-        model_size=MusicGenSize.TEST
+        model_size=MusicGenSize.TEST,
     ).cuda()
 
-    # Tokenize the audio
-    nes_input_tokens, nes_target_tokens, nes_meta = tokenize_audio(AUDIO_PATH, TEST_SECs, dac) # type: ignore
-    snes_input_tokens, snes_target_tokens, snes_meta = tokenize_audio(AUDIO_PATH_SNES, TEST_SECs, dac) # type: ignore
-    jamendo_input_tokens, jamendo_target_tokens, jamendo_meta = tokenize_audio(AUDIO_PATH_JAMENDO, TEST_SECs, dac) # type: ignore
+    # Audio tokenization
+    nes_input_tokens,    nes_target_tokens,    nes_meta    = tokenize_audio(AUDIO_PATH,        TEST_SECs, dac)  # type: ignore
+    snes_input_tokens,   snes_target_tokens,   snes_meta   = tokenize_audio(AUDIO_PATH_SNES,   TEST_SECs, dac)  # type: ignore
+    jamendo_input_tokens,jamendo_target_tokens,jamendo_meta = tokenize_audio(AUDIO_PATH_JAMENDO,TEST_SECs, dac)  # type: ignore
 
     metas = [nes_meta, snes_meta, jamendo_meta]
-    model_inputs = torch.cat([nes_input_tokens, snes_input_tokens, jamendo_input_tokens])
-    print(f"(test_musicgen_t5_dac) Model Inputs shape {model_inputs.shape}")
-    target_tokens = torch.cat([nes_target_tokens, snes_target_tokens, jamendo_target_tokens])
+    model_inputs  = torch.cat([nes_input_tokens,  snes_input_tokens,  jamendo_input_tokens],  dim=0)
+    target_tokens = torch.cat([nes_target_tokens, snes_target_tokens, jamendo_target_tokens], dim=0)
+
+    print(f"(test_musicgen_t5_dac) Model Inputs shape  {model_inputs.shape}")
     print(f"(test_musicgen_t5_dac) Target Tokens shape {target_tokens.shape}")
 
-    # NOTICE: All hyperparams here are for test
-    criterium = torch.nn.CrossEntropyLoss(ignore_index=model.pad_token_id) # Ignore the padding tokens in the loss calculation
+    # DataLoaders
+    dataset = TextAudioTokenDataset(
+        texts=conditioners_txt,
+        conditioners=conditioners,
+        src_mask=src_mask,
+        input_tokens=model_inputs,
+        target_tokens=target_tokens,
+        metas=metas,
+    )
+
+    train_loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collate_audio_text,
+        drop_last=False,
+        pin_memory=False,
+    )
+
+    # Training
+    criterium = torch.nn.CrossEntropyLoss(ignore_index=model.pad_token_id)
     optim = torch.optim.AdamW(model.parameters(), lr=5e-4, betas=(0.9, 0.95), weight_decay=0.0)
 
     model.train()
-    for update in range(1, UPDATES+1):
-        optim.zero_grad()
-        logits, _ = model(src=conditioners, tgt=model_inputs)
+    update = 0
+    epoch = 0
+    while update < UPDATES:
+        epoch += 1
+        for texts, cond_b, mask_b, inp_b, tgt_b, _ in train_loader:
+            optim.zero_grad()
 
-        # Reshape for CrossEntropyLoss
-        flat_logits = logits.reshape(-1, model.vocab_size)
-        flat_targets = target_tokens.reshape(-1)
+            logits, _ = model(src=cond_b, tgt=inp_b, src_mask=mask_b)
 
-        # Compute loss and step
-        loss = criterium(flat_logits, flat_targets)
-        loss.backward()
-        optim.step()
+            # Reshape for CrossEntropyLoss
+            flat_logits  = logits.reshape(-1, model.vocab_size)
+            flat_targets = tgt_b.reshape(-1)
 
-        print(f"Update {update} | Loss: {loss.item():.4f}")
+            loss = criterium(flat_logits, flat_targets)
+            loss.backward()
+            optim.step()
 
-    # Run generation
+            update += 1
+            print(f"Epoch {epoch} | Update {update}/{UPDATES} | "
+                  f"batch={texts} | Loss: {loss.item():.4f}")
 
+            if update >= UPDATES:
+                break
+
+    # Generation 
     model.eval()
     with torch.no_grad():
         audio_tokens, valid_lengths = model.generate(
             src=conditioners,
             src_mask=src_mask,
             max_new_tokens=model.max_seq_len,
-            temperature=1.0, # < 1. -> eliminate randomness | = 1. -> the distribution learned | > 1. -> aproximate a uniform distribution
-            top_k=32
+            temperature=1,   # < 1 -> eliminate randomness | = 1 -> learned dist | > 1 -> ~uniform
+            top_k=32,
         )
 
         print(f"(test_musicgen_t5_dac) Generated audio codes shape: {audio_tokens.shape}\n")
@@ -327,14 +416,14 @@ def test_musicgen_t5_dac():
             audio_tokens_b = audio_tokens[b].clone().unsqueeze(0)
             audio_tokens_b = torch.clamp(audio_tokens_b, min=0, max=dac.orig_vocab_size - 1)
 
-            # Truncate valid samples cleanly on AudioSignal or raw Tensor
             valid_samples = valid_lengths[b].item()
             audio_tokens_b = audio_tokens_b[:, :, :valid_samples]
-            print(f"(test_musicgen_t5_dac) Clean audio codes shape: {audio_tokens_b.shape} | valid_samples {valid_samples}")
+            print(f"(test_musicgen_t5_dac) Clean audio codes shape: {audio_tokens_b.shape} | "
+                  f"valid_samples {valid_samples}")
 
             total_generated_samples = audio_tokens_b.shape[-1] * dac.model.hop_length
-            meta['original_length'] = min(meta['original_length'], total_generated_samples)
+            meta["original_length"] = min(meta["original_length"], total_generated_samples)
             decoded_audio = dac.decode(audio_tokens_b.cpu(), meta)
 
             print(f"(test_musicgen_t5_dac) Decoded & Valid audio shape: {decoded_audio.shape}\n")
-            decoded_audio.write(f'test_musicgen_t5_dac_{conditioners_txt[b]}.wav')
+            decoded_audio.write(f"test_musicgen_t5_dac_{conditioners_txt[b]}.wav")
