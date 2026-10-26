@@ -148,7 +148,7 @@ class DelayProvider():
 
 
 class MusicgenSinusoidalPositionalEmbedding(nn.Module):
-    def __init__(self, num_positions: int, embedding_dim: int, dtype = torch.bfloat16):
+    def __init__(self, num_positions: int, embedding_dim: int, dtype = torch.float32):
         super().__init__()
         self.dtype = dtype
         self.embedding_dim = embedding_dim
@@ -173,7 +173,7 @@ class MusicgenSinusoidalPositionalEmbedding(nn.Module):
 
     @torch.no_grad()
     def forward(self, input_ids: torch.Tensor, past_key_values_length: int = 0):
-        _, _, seq_len = input_ids.size() 
+        seq_len = input_ids.size(-1)
         position_ids = (torch.arange(seq_len) + past_key_values_length).to(input_ids.device)
         
         # TODO was: if seq_len > self.weights.size(0): # type: ignore
@@ -185,7 +185,7 @@ class MusicgenSinusoidalPositionalEmbedding(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model, n_heads, dtype=torch.bfloat16):
+    def __init__(self, d_model, n_heads, dtype=torch.float32):
         super().__init__()
 
         self.n_heads = n_heads
@@ -219,7 +219,7 @@ class CausalSelfAttention(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, d_model, n_heads, dtype=torch.bfloat16):
+    def __init__(self, d_model, n_heads, dtype=torch.float32):
         super().__init__()
 
         self.n_heads = n_heads
@@ -259,7 +259,7 @@ class CrossAttention(nn.Module):
 
 
 class MusicGenDecoderLayer(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dim_feedforward: int, dropout: float = 0.1, dtype=torch.bfloat16):
+    def __init__(self, d_model:int, n_heads:int, dim_feedforward:int, dropout:float=0.1, dtype=torch.float32):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
@@ -351,9 +351,10 @@ class MusicGenTransformer(BaseDecoder):
             bos_token_id,
             frame_rate:int,
             audio_duration:int,
+            conditioner_d_model:int,
             encoder:tp.Optional[nn.TransformerEncoder] = None,
             model_size:MusicGenSize=MusicGenSize.SMALL, 
-            dtype:torch.dtype=torch.bfloat16
+            dtype:torch.dtype=torch.float32
         ):
         """
             src/memory mask: True or 1 means valid token & False or 0 means a masked token
@@ -374,6 +375,10 @@ class MusicGenTransformer(BaseDecoder):
         self.pos_embedding = MusicgenSinusoidalPositionalEmbedding(num_positions=self.max_seq_len, embedding_dim=self.size_params.d_model)
 
         self.encoder = encoder
+        self.conditioner_d_model = conditioner_d_model
+
+        if self.conditioner_d_model > 0 and self.conditioner_d_model != self.size_params.d_model:
+            self.conditioner_proj = nn.Linear(conditioner_d_model, self.size_params.d_model)
 
         dec_layers = nn.ModuleList([
             MusicGenDecoderLayer(
@@ -401,6 +406,7 @@ class MusicGenTransformer(BaseDecoder):
         """
         B, K, S = tgt.shape
 
+        # CFG condition routing
         if pre_comp_src:
             memory = src
             memory_mask = src_mask
@@ -413,6 +419,10 @@ class MusicGenTransformer(BaseDecoder):
             elif(src is not None) and (self.encoder is None) and (not drop_conditioning): # pre_comp_src is False but matches an equivalent condition
                 memory = src
                 memory_mask = src_mask
+
+        if memory is not None:
+            if (self.conditioner_d_model > 0) and (memory.shape[-1] != self.size_params.d_model):
+                memory = self.conditioner_proj(memory)
 
         # in the T5 memory_mask True means sequence, and for SDPA true means sequence and false means padding
         if memory_mask is not None:
@@ -486,17 +496,16 @@ class MusicGenTransformer(BaseDecoder):
         self,
         max_new_tokens: int,
         src: tp.Optional[torch.Tensor] = None,
-        batch_size = 1,
-        src_mask=None,
-        temperature: float = 1.0,
-        top_k: int = 250,
-        top_p=0.90,
-        cfg_scale: float = 3.0
+        batch_size:int = 1,
+        src_mask:tp.Optional[torch.Tensor] = None,
+        temperature:float = 1.0,
+        top_k:int = 250,
+        top_p:float = 0.90,
+        cfg_scale:float = 3.0
     ):
-
         assert max_new_tokens <= self.max_seq_len
-
         self.eval()
+
         device = next(self.parameters()).device
         B = src.shape[0] if src is not None else batch_size
         K = self.num_codebooks
@@ -532,10 +541,12 @@ class MusicGenTransformer(BaseDecoder):
             for k in range(K):
                 if step < k:
                     mask = torch.ones(self.vocab_size, dtype=torch.bool, device=device)
+
                     if step == k - 1:
                         mask[self.bos_token_id] = False
                     else:
                         mask[self.pad_token_id] = False
+
                     next_token_logits[:, k, mask] = -float("inf")
                 else:
                     next_token_logits[:, k, self.pad_token_id] = -float("inf")

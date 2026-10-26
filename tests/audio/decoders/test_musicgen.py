@@ -106,6 +106,7 @@ def test_musicgen_encodec():
             bos_token_id=encodec.bos_token_id,
             frame_rate=int(encodec.frame_rate),
             audio_duration=TEST_SECs,
+            conditioner_d_model=-1,
             model_size=MusicGenSize.TEST
         ).cuda()
 
@@ -179,6 +180,7 @@ def test_musicgen_dac():
         bos_token_id=dac.bos_token_id,
         frame_rate=int(dac.frame_rate),
         audio_duration=TEST_SECs,
+        conditioner_d_model=-1,
         model_size=MusicGenSize.TEST
     ).cuda()
 
@@ -302,16 +304,13 @@ def test_musicgen_t5_dac():
 
     # T5
     dec_size = MUSICGEN_SIZES["test"]
-    t5 = T5Conditioner("t5-base", dec_size.d_model, device="cuda").cuda()
+    t5 = T5Conditioner("t5-base").cuda()
 
     conditioners_txt = ["NES", "SUPER NINTENDO", "MTG JAMENDO DATASET"]
 
     t5_inputs = t5.tokenize(conditioners_txt)  # type: ignore
     with torch.no_grad():
         conditioners, src_mask = t5(t5_inputs)
-
-    conditioners = conditioners.to(torch.bfloat16)
-    src_mask = src_mask.to(torch.bfloat16)
 
     print(f"test_musicgen_t5_dac src_mask:\n{src_mask}")
     print(f"(test_musicgen_t5_dac) Conditioners shape {conditioners.shape}")
@@ -330,7 +329,8 @@ def test_musicgen_t5_dac():
         bos_token_id=dac.bos_token_id,
         frame_rate=int(dac.frame_rate),
         audio_duration=TEST_SECs,
-        model_size=MusicGenSize.TEST,
+        conditioner_d_model=768,
+        model_size=MusicGenSize.TEST
     ).cuda()
 
     # Audio tokenization

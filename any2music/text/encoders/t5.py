@@ -42,12 +42,17 @@ class T5Conditioner(BaseConditioner):
     }
 
     def __init__(
-            self, name: str, output_dim: int, device: str, finetune: bool = False,
+            self, name: str, output_dim: int = -1, device: str = 'cuda', finetune: bool = False,
             dtype: torch.dtype = torch.bfloat16, word_dropout: float = 0.,
             # normalize_text: bool = False
         ):
         assert name in self.MODELS, f"Unrecognized t5 model name (should in {self.MODELS})"
-        super().__init__(self.MODELS_DIMS[name], output_dim)
+
+        self.d_model = self.MODELS_DIMS[name]
+
+        super().__init__(self.d_model, output_dim)
+
+        self.output_dim = output_dim
         self.device = device
         self.name = name
         self.finetune = finetune
@@ -115,7 +120,9 @@ class T5Conditioner(BaseConditioner):
         with torch.set_grad_enabled(self.finetune), self.autocast:
             embeds = self.t5(**inputs).last_hidden_state
 
-        embeds = self.output_proj(embeds.to(self.output_proj.weight))
+        if self.output_dim > -1:
+            embeds = self.output_proj(embeds.to(self.output_proj.weight))
+
         embeds = (embeds * mask.unsqueeze(-1))
 
         return embeds, mask

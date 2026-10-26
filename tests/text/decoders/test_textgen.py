@@ -20,6 +20,8 @@ def get_text_tokens(text_tokens_path) -> tuple[torch.Tensor, torch.Tensor]:
     with open(text_tokens_path, 'r') as f:
         text_tokens = json.load(f)
 
+    # Prepend BOS and append EOS so generation starts from BOS during inference
+    text_tokens = [BOS] + text_tokens + [EOS]
     text_tokens = torch.Tensor(text_tokens).unsqueeze(0).int()
 
     input_tokens = text_tokens[:, :-1]
@@ -34,7 +36,7 @@ def test_textgen_t5():
     
     # Get tokenized description
     dec_size = TEXTGEN_SIZES["test"]
-    t5 = T5Conditioner('t5-base', dec_size.d_model, device='cuda').cuda()
+    t5 = T5Conditioner('t5-base').cuda()
 
     with open(DESC_PATH, 'r') as f:
         desc = f.read()
@@ -54,6 +56,7 @@ def test_textgen_t5():
         eos_token_id=EOS,
         bos_token_id=BOS,
         max_seq_len = 1500,
+        conditioner_d_model=768,
         model_size=TextGenSize.TEST
     ).cuda()
 
@@ -65,11 +68,10 @@ def test_textgen_t5():
     for update in range(UPDATES):
         optim.zero_grad()
 
-        desc_embs = desc_embs.to(torch.bfloat16)
         input_tokens = input_tokens.cuda()
         desc_embs_mask = desc_embs_mask.cuda()
 
-        logits = model(src=desc_embs, tgt=input_tokens, src_mask=desc_embs_mask)
+        logits, _ = model(src=desc_embs, tgt=input_tokens, src_mask=desc_embs_mask)
 
         # Compute loss and step
         loss = criterium(logits.permute(0, 2, 1), target_tokens.long().cuda())
@@ -82,9 +84,10 @@ def test_textgen_t5():
     model.eval()
     with torch.no_grad():
         print(f"Generating audio tokens for {DESC_PATH}...")
-        text_tokens = model.generate(
-            src=desc_embs,
-            src_mask=desc_embs_mask,
+        text_tokens, valid_lengths = model.generate(
+            src=None,
+            src_mask=None,
+            batch_size= 5,
             max_new_tokens=model.max_seq_len,
             temperature=1e-4, # < 1 -> eliminate randomness | = 1 -> the distribution learned | > 1 -> aproximate a uniform distribution
             top_k=1
@@ -94,6 +97,11 @@ def test_textgen_t5():
         print(f"Generated text head: {text_tokens[:, :5]}\n")
         print(f"Generated text tail: {text_tokens[:, -5:]}\n")
 
-        text_tokens = text_tokens.detach().cpu()
-        with open('test_textgen_t5.json', 'w') as f:
-            json.dump(text_tokens.tolist(), f)
+        B = text_tokens.shape[0]
+        for b in range(B):
+            valid_len = valid_lengths[b]
+            text_tokens_b = text_tokens[b].detach().cpu()[:valid_len]
+            print(f"text_tokens_b shape: {text_tokens_b.shape} iter {b}\n")
+
+            with open(f'test_textgen_t5_{b}.json', 'w') as f:
+                json.dump(text_tokens_b.tolist(), f)
