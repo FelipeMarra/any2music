@@ -307,7 +307,7 @@ class TextGenTransformer(BaseDecoder):
                 memory_mask = src_mask
 
         if memory is not None:
-            if (self.conditioner_proj is not None) and (memory.shape[-1] != self.self.size_params.d_model):
+            if (self.conditioner_proj is not None) and (memory.shape[-1] != self.size_params.d_model):
                 memory = self.conditioner_proj(memory)
 
         # in the T5 memory_mask True means sequence, and for SDPA true means sequence and false means padding
