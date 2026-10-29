@@ -9,11 +9,48 @@ authors = [
     { name="Felipe Marra", email="felipeferreiramarra@gmail.com" },
 ]
 description = "A package from the MOSAIC Group at Universidade Federal de Minas Gerais. At first it aims at generating music in various modalities and conditioned on various modalities."
+dependencies = [
+    "torch==2.11.0",
+    "torchaudio==2.11.0", 
+    "torchvision==0.26.0",
+    "tqdm",
+    "transformers==5.8.0",
+    "einops",
+    "torchcodec",
+    "descript-audio-codec",
+    "pytest",
+    "frechet-audio-distance==0.3.4",
+    "laion-clap==1.1.7",
+    "hear21passt @ git+https://github.com/kkoutini/passt_hear21.git@0.0.18",
+]
 
-dynamic = ["dependencies"]
+[tool.uv.sources]
+any2music = { path = "any2music/", editable = true }
+torch = [
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
+]
+torchaudio = [
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
+]
+torchcodec = [
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
+]
 
-[tool.setuptools.dynamic]
-dependencies = {file = ["requirements.txt"]}
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+
+
+# dynamic = ["dependencies"]
+
+# [tool.setuptools.dynamic]
+# dependencies = {file = ["requirements.txt"]}
 
 [tool.setuptools.packages.find]
 where = ["."]
