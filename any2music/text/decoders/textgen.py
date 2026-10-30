@@ -391,19 +391,19 @@ class TextGenTransformer(BaseDecoder):
         device = next(self.parameters()).device
         B = src.shape[0] if src is not None else batch_size
 
-        # Initial prompt tokens (shape B, 2)
+        # Initial prompt tokens (shape B, 1)
         tgt = torch.full((B, 1), self.bos_token_id, dtype=torch.long, device=device)
 
         # Init conditioning
         memory, memory_mask = None, None
 
         if src is not None:
-            if self.encoder is not None:
+            if getattr(self, "encoder", None) is not None:
                 memory, memory_mask = self.encoder(src)
             else:
                 memory, memory_mask = src, src_mask
 
-        # Initial sequence (length 2) to initialize KV caches
+        # Initial sequence (length 1) to initialize KV caches
         if src is not None:
             logits_cond, kv_cond = self(src=memory, tgt=tgt, src_mask=memory_mask, past_kv=None, pre_comp_src=True)
             logits_uncond, kv_uncond = self(src=None, tgt=tgt, drop_conditioning=True, past_kv=None)
@@ -423,16 +423,16 @@ class TextGenTransformer(BaseDecoder):
             next_token_logits[:, self.bos_token_id] = -float("inf")
 
             # Filtering and Sampling
-            next_token_logits = self.top_k_filtering(next_token_logits, top_k=top_k)
-            probs = self.top_p_filtering(next_token_logits, p=top_p)
+            next_token_logits = getattr(self, "top_k_filtering", self._top_k_filtering if hasattr(self, "_top_k_filtering") else lambda x, **kw: x)(next_token_logits, top_k=top_k)
+            probs = getattr(self, "top_p_filtering", self._top_p_filtering if hasattr(self, "_top_p_filtering") else lambda x, **kw: torch.softmax(x, dim=-1))(next_token_logits, p=top_p)
 
             next_tokens = torch.multinomial(probs, num_samples=1)
 
-            # Logic for sequences in the batch that already finisehed
+            # Logic for sequences in the batch that already finished
             eos_hit = (next_tokens[:, 0] == self.eos_token_id) # (B,)
             newly_finished = eos_hit & ~finished
 
-            # Mask rows that were already finished with eos to trigger valid_mask later
+            # Mask rows that were already finished with eos
             already_finished = finished.clone()
             if already_finished.any():
                 next_tokens[already_finished] = self.eos_token_id
@@ -459,11 +459,25 @@ class TextGenTransformer(BaseDecoder):
         # Slice out initial BOS token
         tgt = tgt[:, 1:]
 
-        invalid_mask = (tgt < 0) | (tgt >= self.eos_token_id)
+        # Find where the EOS tokens actually are in the sequence instead of thresholding
+        is_eos = (tgt == self.eos_token_id)
+        
+        # argmax returns the index of the first True value. 
+        eos_indices = is_eos.float().argmax(dim=-1)
+        has_eos = is_eos.any(dim=-1)
+        
+        # If a sequence didn't hit EOS, its valid length is the full length
+        valid_lengths = torch.where(
+            has_eos, 
+            eos_indices, 
+            torch.tensor(tgt.shape[-1], device=device, dtype=torch.long)
+        )
 
-        valid_mask = (tgt >= 0) & (tgt < self.eos_token_id)
-        valid_lengths = valid_mask.sum(dim=-1) # Shape: (B,)
-
-        tgt[invalid_mask] = 0
+        # Create a positional mask to zero out everything after (and including) the EOS token
+        seq_range = torch.arange(tgt.shape[-1], device=device).unsqueeze(0)
+        invalid_mask = seq_range >= valid_lengths.unsqueeze(1)
+        
+        # Replaces out-of-bounds/padded tokens with the padding token ID
+        tgt[invalid_mask] = self.pad_token_id
 
         return tgt, valid_lengths

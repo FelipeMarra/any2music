@@ -8,11 +8,10 @@ from any2music.text.decoders.textgen import TextGenSize, TEXTGEN_SIZES, TextGenT
 TEXT_TOKENS_PATH = "./samples/midi/348_TheLegendofZelda_01_02OverworldBGM_midi_tokens.json"
 DESC_PATH = "./samples/description/348_TheLegendofZelda_01_02OverworldBGM_music_track_description.md"
 
-ORIG_VOCAB_SIZE = 406
-BOS = ORIG_VOCAB_SIZE +1
-PAD = ORIG_VOCAB_SIZE +2
-EOS = ORIG_VOCAB_SIZE +3
-VOCAB_SIZE = EOS + 1
+VOCAB_SIZE = 565
+PAD = 0
+BOS = 1
+EOS = 2
 
 UPDATES = 100
 
